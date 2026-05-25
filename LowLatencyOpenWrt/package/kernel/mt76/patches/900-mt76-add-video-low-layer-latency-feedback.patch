@@ -1,0 +1,318 @@
+mt76：向 mac80211 反馈视频包低层发送延迟
+
+在 mt76 PCIe 发送路径记录驱动侧可见的低层发送延迟代理值。样本从
+mt76 接管或取出 skb 准备发送时开始，时间戳随 TXWI cache 传递，并在
+驱动观察到 TXFREE 时结束。
+
+debugfs 同时输出最近一次样本的 driver_queue、dma_to_txfree 和 total：
+driver_queue 表示 mt76 接管后到安装 DMA ring 前的等待，dma_to_txfree
+表示 DMA/ring 安装后到 TXFREE 的完成时间，total 为两者合计。
+
+该值不是纯硬件队列等待时间，而是驱动侧可见的低层发送代理值，包含
+驱动队列、DMA/ring 驻留、固件/硬件队列、信道竞争、重传、空口发送
+以及完成通知返回等过程。它不包含 skb 到达 mt76 前的 mac80211 FQ/CoDel
+排队时间，也不覆盖非 TXFREE 或非 PCIe 路径。
+
+视频流样本会通过 ieee80211_video_low_layer_latency_report() 上报给
+mac80211，供视频帧延迟风险估计使用；mt76 debugfs 仍保留所有测得样本
+的聚合统计。该补丁只提供测量反馈，不改变 mt76 的发送调度逻辑。
+---
+diff --git a/debugfs.c b/debugfs.c
+index 41d1d48..47a21fd 100644
+--- a/debugfs.c
++++ b/debugfs.c
+@@ -51,6 +51,51 @@ mt76_napi_threaded_get(void *data, u64 *val)
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_napi_threaded, mt76_napi_threaded_get,
+ 			 mt76_napi_threaded_set, "%llu\n");
+ 
++static int mt76_low_layer_latency_read(struct seq_file *s, void *data)
++{
++	struct mt76_dev *dev = dev_get_drvdata(s->private);
++	unsigned long flags;
++	u64 samples;
++	u64 ewma;
++	u64 max;
++	u64 last;
++	u64 last_driver_queue;
++	u64 last_dma_to_txfree;
++	u64 last_start;
++	u64 last_dma;
++	u64 last_end;
++	u16 last_wcid;
++	u8 last_qid;
++
++	spin_lock_irqsave(&dev->low_layer_latency_lock, flags);
++	samples = dev->low_layer_latency_samples;
++	ewma = dev->low_layer_latency_ewma_ns;
++	max = dev->low_layer_latency_max_ns;
++	last = dev->low_layer_latency_last_ns;
++	last_driver_queue = dev->low_layer_latency_last_driver_queue_ns;
++	last_dma_to_txfree = dev->low_layer_latency_last_dma_to_txfree_ns;
++	last_start = dev->low_layer_latency_last_start_ns;
++	last_dma = dev->low_layer_latency_last_dma_ns;
++	last_end = dev->low_layer_latency_last_end_ns;
++	last_wcid = dev->low_layer_latency_last_wcid;
++	last_qid = dev->low_layer_latency_last_qid;
++	spin_unlock_irqrestore(&dev->low_layer_latency_lock, flags);
++
++	seq_printf(s, "samples=%llu\n", samples);
++	seq_printf(s, "last_us=%llu\n", div_u64(last, NSEC_PER_USEC));
++	seq_printf(s, "ewma_us=%llu\n", div_u64(ewma, NSEC_PER_USEC));
++	seq_printf(s, "max_us=%llu\n", div_u64(max, NSEC_PER_USEC));
++	seq_printf(s, "last_driver_queue_us=%llu\n", div_u64(last_driver_queue, NSEC_PER_USEC));
++	seq_printf(s, "last_dma_to_txfree_us=%llu\n", div_u64(last_dma_to_txfree, NSEC_PER_USEC));
++	seq_printf(s, "last_wcid=%u\n", last_wcid);
++	seq_printf(s, "last_qid=%u\n", last_qid);
++	seq_printf(s, "last_start_ns=%llu\n", last_start);
++	seq_printf(s, "last_dma_ns=%llu\n", last_dma);
++	seq_printf(s, "last_end_ns=%llu\n", last_end);
++
++	return 0;
++}
++
+ int mt76_queues_read(struct seq_file *s, void *data)
+ {
+ 	struct mt76_dev *dev = dev_get_drvdata(s->private);
+@@ -115,6 +160,8 @@ mt76_register_debugfs_fops(struct mt76_phy *phy,
+ 	debugfs_create_file_unsafe("regval", 0600, dir, dev, fops);
+ 	debugfs_create_file_unsafe("napi_threaded", 0600, dir, dev,
+ 				   &fops_napi_threaded);
++	debugfs_create_devm_seqfile(dev->dev, "low-layer-latency", dir,
++				    mt76_low_layer_latency_read);
+ 	debugfs_create_blob("eeprom", 0400, dir, &dev->eeprom);
+ 	if (dev->otp.data)
+ 		debugfs_create_blob("otp", 0400, dir, &dev->otp);
+diff --git a/dma.c b/dma.c
+index f240016..39d5467 100644
+--- a/dma.c
++++ b/dma.c
+@@ -368,6 +368,23 @@ mt76_dma_add_buf(struct mt76_dev *dev, struct mt76_queue *q,
+ 	q->entry[idx].txwi = txwi;
+ 	q->entry[idx].skb = skb;
+ 	q->entry[idx].wcid = 0xffff;
++	if (txwi) {
++		struct mt76_txwi_cache *t = txwi;
++		u64 now = ktime_get_ns();
++		struct mt76_tx_cb *cb = skb ? mt76_tx_skb_cb(skb) : NULL;
++		u32 now_us = div_u64(now, NSEC_PER_USEC);
++
++		t->low_layer_start_ns = now;
++		if (cb && cb->low_layer_start_us) {
++			u64 driver_queue =
++				(u32)(now_us - cb->low_layer_start_us) * NSEC_PER_USEC;
++
++			t->low_layer_start_ns -= min_t(u64, driver_queue, now);
++		}
++		t->low_layer_dma_ns = now;
++		t->qid = q->hw_idx;
++		t->low_layer_video = cb && (cb->flags & MT_TX_CB_LOW_LAYER_VIDEO);
++	}
+ 
+ 	return idx;
+ }
+diff --git a/mac80211.c b/mac80211.c
+index ff86f4f..83f49f6 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -684,6 +684,7 @@ mt76_alloc_device(struct device *pdev, unsigned int size,
+ 	spin_lock_init(&dev->lock);
+ 	spin_lock_init(&dev->cc_lock);
+ 	spin_lock_init(&dev->status_lock);
++	spin_lock_init(&dev->low_layer_latency_lock);
+ 	spin_lock_init(&dev->wed_lock);
+ 	mutex_init(&dev->mutex);
+ 	init_waitqueue_head(&dev->tx_wait);
+diff --git a/mt76.h b/mt76.h
+index d6a1870..aa45cce 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -9,6 +9,7 @@
+ #include <linux/kernel.h>
+ #include <linux/io.h>
+ #include <linux/spinlock.h>
++#include <linux/ktime.h>
+ #include <linux/skbuff.h>
+ #include <linux/leds.h>
+ #include <linux/usb.h>
+@@ -459,7 +460,10 @@ struct mt76_txwi_cache {
+ 		void *ptr;
+ 	};
+ 
++	u64 low_layer_start_ns;
++	u64 low_layer_dma_ns;
+ 	u8 qid;
++	bool low_layer_video;
+ };
+ 
+ struct mt76_rx_tid {
+@@ -485,6 +489,7 @@ struct mt76_rx_tid {
+ #define MT_TX_CB_DMA_DONE		BIT(0)
+ #define MT_TX_CB_TXS_DONE		BIT(1)
+ #define MT_TX_CB_TXS_FAILED		BIT(2)
++#define MT_TX_CB_LOW_LAYER_VIDEO	BIT(3)
+ 
+ #define MT_PACKET_ID_MASK		GENMASK(6, 0)
+ #define MT_PACKET_ID_NO_ACK		0
+@@ -505,6 +510,7 @@ struct mt76_tx_cb {
+ 	u16 wcid;
+ 	u8 pktid;
+ 	u8 flags;
++	u32 low_layer_start_us;
+ };
+ 
+ enum {
+@@ -981,6 +987,18 @@ struct mt76_dev {
+ 	wait_queue_head_t tx_wait;
+ 	/* spinclock used to protect wcid pktid linked list */
+ 	spinlock_t status_lock;
++	spinlock_t low_layer_latency_lock;
++	u64 low_layer_latency_samples;
++	u64 low_layer_latency_ewma_ns;
++	u64 low_layer_latency_max_ns;
++	u64 low_layer_latency_last_ns;
++	u64 low_layer_latency_last_driver_queue_ns;
++	u64 low_layer_latency_last_dma_to_txfree_ns;
++	u64 low_layer_latency_last_start_ns;
++	u64 low_layer_latency_last_dma_ns;
++	u64 low_layer_latency_last_end_ns;
++	u16 low_layer_latency_last_wcid;
++	u8 low_layer_latency_last_qid;
+ 
+ 	u32 wcid_mask[DIV_ROUND_UP(MT76_N_WCIDS, 32)];
+ 
+@@ -1567,6 +1585,9 @@ void mt76_tx_status_skb_done(struct mt76_dev *dev, struct sk_buff *skb,
+ 			     struct sk_buff_head *list);
+ void __mt76_tx_complete_skb(struct mt76_dev *dev, u16 wcid, struct sk_buff *skb,
+ 			    struct list_head *free_list);
++void mt76_low_layer_latency_record(struct mt76_dev *dev, u64 start_ns,
++				   u64 dma_ns, u16 wcid, u8 qid,
++				   bool video_flow);
+ static inline void
+ mt76_tx_complete_skb(struct mt76_dev *dev, u16 wcid, struct sk_buff *skb)
+ {
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index 3304b59..f304833 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -1187,6 +1187,9 @@ void mt76_connac2_txwi_free(struct mt76_dev *dev, struct mt76_txwi_cache *t,
+ 	if (sta && likely(t->skb->protocol != cpu_to_be16(ETH_P_PAE)))
+ 		mt76_connac2_tx_check_aggr(sta, txwi);
+ 
++	mt76_low_layer_latency_record(dev, t->low_layer_start_ns,
++				       t->low_layer_dma_ns, wcid_idx,
++				       t->qid, t->low_layer_video);
+ 	__mt76_tx_complete_skb(dev, wcid_idx, t->skb, free_list);
+ out:
+ 	t->skb = NULL;
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index 753c698..dc5e03b 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -1301,6 +1301,9 @@ mt7996_txwi_free(struct mt7996_dev *dev, struct mt76_txwi_cache *t,
+ 		wcid_idx = le32_get_bits(txwi[9], MT_TXD9_WLAN_IDX);
+ 	}
+ 
++	mt76_low_layer_latency_record(mdev, t->low_layer_start_ns,
++				       t->low_layer_dma_ns, wcid_idx,
++				       t->qid, t->low_layer_video);
+ 	__mt76_tx_complete_skb(mdev, wcid_idx, t->skb, free_list);
+ 
+ out:
+diff --git a/tx.c b/tx.c
+index 9ec6d0b..257d431 100644
+--- a/tx.c
++++ b/tx.c
+@@ -5,6 +5,50 @@
+ 
+ #include "mt76.h"
+ 
++void mt76_low_layer_latency_record(struct mt76_dev *dev, u64 start_ns,
++				   u64 dma_ns, u16 wcid, u8 qid,
++				   bool video_flow)
++{
++	u64 now = ktime_get_ns();
++	u64 driver_queue = 0;
++	u64 dma_to_txfree = 0;
++	u64 latency;
++	unsigned long flags;
++
++	if (!start_ns || now <= start_ns)
++		return;
++
++	latency = now - start_ns;
++	if (dma_ns && dma_ns >= start_ns && now > dma_ns) {
++		driver_queue = dma_ns - start_ns;
++		dma_to_txfree = now - dma_ns;
++	}
++
++	if (video_flow)
++		ieee80211_video_low_layer_latency_report(dev->hw, latency);
++
++	spin_lock_irqsave(&dev->low_layer_latency_lock, flags);
++	if (!dev->low_layer_latency_samples)
++		dev->low_layer_latency_ewma_ns = latency;
++	else
++		dev->low_layer_latency_ewma_ns =
++			(dev->low_layer_latency_ewma_ns * 7 + latency) >> 3;
++
++	dev->low_layer_latency_samples++;
++	dev->low_layer_latency_last_ns = latency;
++	dev->low_layer_latency_last_driver_queue_ns = driver_queue;
++	dev->low_layer_latency_last_dma_to_txfree_ns = dma_to_txfree;
++	dev->low_layer_latency_last_start_ns = start_ns;
++	dev->low_layer_latency_last_dma_ns = dma_ns;
++	dev->low_layer_latency_last_end_ns = now;
++	dev->low_layer_latency_last_wcid = wcid;
++	dev->low_layer_latency_last_qid = qid;
++	if (latency > dev->low_layer_latency_max_ns)
++		dev->low_layer_latency_max_ns = latency;
++	spin_unlock_irqrestore(&dev->low_layer_latency_lock, flags);
++}
++EXPORT_SYMBOL_GPL(mt76_low_layer_latency_record);
++
+ static int
+ mt76_txq_get_qid(struct ieee80211_txq *txq)
+ {
+@@ -127,7 +171,14 @@ mt76_tx_status_skb_add(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 	struct mt76_tx_cb *cb = mt76_tx_skb_cb(skb);
+ 	int pid;
+ 
++	u32 low_layer_start_us = cb->low_layer_start_us;
++	u8 low_layer_flags = cb->flags & MT_TX_CB_LOW_LAYER_VIDEO;
++
+ 	memset(cb, 0, sizeof(*cb));
++	cb->wcid = wcid ? wcid->idx : 0xffff;
++	cb->low_layer_start_us = low_layer_start_us ?:
++		(u32)div_u64(ktime_get_ns(), NSEC_PER_USEC);
++	cb->flags = low_layer_flags;
+ 
+ 	if (!wcid || !rcu_access_pointer(dev->wcid[wcid->idx]))
+ 		return MT_PACKET_ID_NO_ACK;
+@@ -305,6 +356,15 @@ __mt76_tx_queue_skb(struct mt76_phy *phy, int qid, struct sk_buff *skb,
+ 	bool non_aql;
+ 	int pending;
+ 	int idx;
++	struct mt76_tx_cb *cb = mt76_tx_skb_cb(skb);
++
++	if (!cb->low_layer_start_us)
++		cb->low_layer_start_us =
++			(u32)div_u64(ktime_get_ns(), NSEC_PER_USEC);
++	if (info->control.flags & IEEE80211_TX_CTRL_VIDEO_FLOW)
++		cb->flags |= MT_TX_CB_LOW_LAYER_VIDEO;
++	else
++		cb->flags &= ~MT_TX_CB_LOW_LAYER_VIDEO;
+ 
+ 	non_aql = !info->tx_time_est;
+ 	idx = dev->queue_ops->tx_queue_skb(phy, q, qid, skb, wcid, sta);
+@@ -334,6 +394,11 @@ mt76_tx(struct mt76_phy *phy, struct ieee80211_sta *sta,
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 	struct ieee80211_hdr *hdr = (void *)skb->data;
+ 	struct sk_buff_head *head;
++	struct mt76_tx_cb *cb = mt76_tx_skb_cb(skb);
++
++	cb->low_layer_start_us =
++		(u32)div_u64(ktime_get_ns(), NSEC_PER_USEC);
++	cb->flags &= ~MT_TX_CB_LOW_LAYER_VIDEO;
+ 
+ 	if (mt76_testmode_enabled(phy)) {
+ 		ieee80211_free_txskb(phy->hw, skb);

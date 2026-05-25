@@ -1,0 +1,1553 @@
+mac80211：增加视频帧延迟风险估计与帧级保护
+
+在 AVG/LAST 视频帧感知基础上增加轻量级延迟风险估计。该估计器只
+使用 AP 侧可见的信息：视频帧到达节奏、同一 FQ flow 的队列积压
+代理值，以及驱动上报的低层发送延迟样本。
+
+驱动可通过 ieee80211_video_low_layer_latency_report() 上报低层发送
+延迟样本，mac80211 使用 EWMA 维护该样本，并将其作为 Post-AP 低层
+延迟代理值的一部分。
+
+debugfs 输出 Pre-AP 相对延迟、MAC/FQ 队列等待代理值、驱动低层延迟
+EWMA、总延迟代理值以及帧级保护触发统计。
+
+该估计值仍然是 AP 侧代理值：mac80211 无法直接获得发送端时间戳、
+接收端播放时间戳、固件内部队列顺序、真实聚合边界、EDCA 竞争和
+重传时间线。
+---
+--- a/include/net/fq.h	2026-05-14 21:11:33.251675168 +0800
++++ b/include/net/fq.h	2026-05-14 21:06:31.831450903 +0800
+@@ -13,6 +13,7 @@
+ #include <linux/types.h>
+ 
+ struct fq_tin;
++struct fq_flow;
+ 
+ enum fq_flow_class {
+ 	FQ_FLOW_CLASS_BEST_EFFORT,
+@@ -27,6 +27,11 @@
+ #define FQ_VIDEO_LAST_TAIL_MAX_BYTES	900
+ #define FQ_VIDEO_LAST_MIN_PACKETS	3
+ #define FQ_VIDEO_MODE_LOCK_EVENTS	3
++#define FQ_VIDEO_FRAME_INTERVAL_DEFAULT_NS	33333333ULL
++#define FQ_VIDEO_FQ_BACKLOG_DELAY_MAX_NS	1000000000ULL
++#define FQ_VIDEO_POST_AP_PROXY_MAX_NS	2000000000ULL
++#define FQ_VIDEO_FRAME_QUEUE_MAX	64
++#define FQ_VIDEO_LOW_LAYER_LATENCY_MAX_NS	1000000000ULL
+ 
+ enum fq_video_frame_event {
+ 	FQ_VIDEO_FRAME_EVENT_NONE,
+@@ -34,6 +39,10 @@
+ 	FQ_VIDEO_FRAME_EVENT_FALLBACK_TIMEOUT = 1 << 1,
+ 	FQ_VIDEO_FRAME_EVENT_AVG_BOUNDARY = 1 << 2,
+ 	FQ_VIDEO_FRAME_EVENT_LAST_BOUNDARY = 1 << 3,
++	FQ_VIDEO_FRAME_EVENT_LATENCY_ESTIMATED = 1 << 4,
++	FQ_VIDEO_FRAME_EVENT_HIGH_LATENCY = 1 << 5,
++	FQ_VIDEO_FRAME_EVENT_FQ_BACKLOG_CLAMPED = 1 << 6,
++	FQ_VIDEO_FRAME_EVENT_POST_AP_CLAMPED = 1 << 7,
+ };
+ 
+ enum fq_video_frame_mode {
+@@ -51,6 +60,15 @@
+  * @size_bucket: coarse packet-size bucket used by AVG mode
+  * @pkt_len: IP packet length used by AVG/LAST sensing
+  * @enqueue_time_ns: timestamp sampled before enqueue
++ * @configured_frame_interval_ns: configured fallback frame interval
++ * @fixed_frame_interval: use configured frame interval without auto updates
++ * @latency_high_ns: high-latency threshold for guard decisions
++ * @low_layer_latency_ns: driver-reported low-layer latency EWMA
++ * @estimated_frame_interval_ns: estimated frame interval
++ * @pre_ap_latency_ns: enqueue-relative Pre-AP latency estimate
++ * @fq_backlog_delay_ns: same-flow FQ backlog delay proxy
++ * @post_ap_proxy_ns: AP-side latency proxy
++ * @experiment_latency_ns: total latency proxy used by the scheduler
+  */
+ struct fq_video_pkt_info {
+ 	bool is_video;
+@@ -59,6 +83,22 @@
+ 	u32 size_bucket;
+ 	u32 pkt_len;
+ 	u64 enqueue_time_ns;
++	u64 configured_frame_interval_ns;
++	bool fixed_frame_interval;
++	u64 latency_high_ns;
++	u64 low_layer_latency_ns;
++	u64 estimated_frame_interval_ns;
++	u64 pre_ap_latency_ns;
++	u64 fq_backlog_delay_ns;
++	u64 post_ap_proxy_ns;
++	u64 experiment_latency_ns;
++};
++
++struct fq_video_dequeue_info {
++	u64 now_ns;
++	u64 latency_high_ns;
++	u64 low_layer_latency_ns;
++	struct fq_flow *flow;
+ };
+ 
+ /**
+@@ -80,15 +128,20 @@
+  * @video_frame_id: incrementing frame id for AVG/LAST size perception
+  * @video_frame_packets: packets seen in the currently open video frame
+  * @video_frame_bytes: bytes seen in the currently open video frame
++ * @video_frame_queue_bytes: skb bytes seen in the currently open frame
+  * @video_frame_size_bucket: AVG packet-size bucket of the current frame
+  * @video_frame_mode: learned AVG/LAST mode for this flow
+  * @video_frame_mode_hits: consecutive boundary hits for mode locking
+  * @video_last_frame_packets: packets seen in the last completed video frame
+  * @video_last_frame_bytes: bytes seen in the last completed video frame
++ * @video_last_frame_queue_bytes: skb bytes seen in the last completed frame
+  * @video_frame_start_ns: enqueue time of the first packet in current frame
+  * @video_last_pkt_ns: enqueue time of the latest video packet in this flow
+  * @video_last_frame_end_ns: enqueue time used for latest frame completion
+  * @video_last_frame_interval_ns: interval between latest two completed frames
++ * @video_frame_ideal_start_ns: ideal AP arrival time of current frame start
++ * @video_tracking_degraded: metadata no longer safely matches queued skbs
++ * @video_guard_budget_bytes: per-frame guard bytes allowed beyond deficit
+  * @video_frame_open: whether a current frame is being tracked
+  * @video_last_pkt_is_frame_end: whether latest video packet ended a frame
+  */
+@@ -102,15 +157,52 @@
+ 	u32 video_frame_packets;
+ 	u32 video_frame_bytes;
+ 	u32 video_frame_size_bucket;
++	u32 video_frame_queue_bytes;
+ 	u32 video_last_frame_packets;
+ 	u32 video_last_frame_bytes;
++	u32 video_last_frame_queue_bytes;
+ 	u64 video_frame_start_ns;
+ 	u64 video_last_pkt_ns;
+ 	u64 video_last_frame_end_ns;
+ 	u64 video_last_frame_interval_ns;
++	u64 video_frame_ideal_start_ns;
++	u64 video_frame_interval_raw_ns;
++	u64 video_frame_interval_est_ns;
++	u64 video_last_pre_ap_latency_ns;
++	u64 video_last_fq_backlog_delay_ns;
++	u64 video_last_low_layer_latency_ns;
++	u64 video_last_post_ap_proxy_ns;
++	u64 video_last_experiment_latency_ns;
++	u64 video_last_dequeue_fq_wait_ns;
++	u64 video_last_dequeue_low_layer_latency_ns;
++	u64 video_last_dequeue_post_ap_proxy_ns;
++	u64 video_last_dequeue_experiment_latency_ns;
++	u32 video_pending_frame_id[FQ_VIDEO_FRAME_QUEUE_MAX];
++	u32 video_pending_frame_bytes[FQ_VIDEO_FRAME_QUEUE_MAX];
++	u32 video_pending_frame_total_bytes[FQ_VIDEO_FRAME_QUEUE_MAX];
++	u64 video_pending_frame_close_ns[FQ_VIDEO_FRAME_QUEUE_MAX];
++	u64 video_pending_frame_pre_ap_latency_ns[FQ_VIDEO_FRAME_QUEUE_MAX];
++	u64 video_pending_frame_fq_backlog_delay_ns[FQ_VIDEO_FRAME_QUEUE_MAX];
++	u8 video_pending_frame_head;
++	u8 video_pending_frame_count;
++	u32 video_dequeue_frame_id;
++	u32 video_dequeue_frame_remaining_bytes;
++	u32 video_dequeue_frame_total_bytes;
++	u64 video_dequeue_frame_close_ns;
++	u64 video_dequeue_frame_pre_ap_latency_ns;
++	u64 video_dequeue_frame_fq_backlog_delay_ns;
++	u8 video_dequeue_frame_guard;
++	u64 video_frame_guard_bytes;
++	u32 video_guard_budget_bytes;
++	u64 video_last_frame_guard_bytes;
++	u64 video_last_pkt_backlog_after_enqueue;
++	u64 video_last_pkt_enqueue_ns;
++	u32 video_last_pkt_len;
+ 	u8 flow_class;
+ 	u8 video_frame_mode;
+ 	u8 video_frame_mode_hits;
++	u8 video_frame_guard_last_dequeue;
++	u8 video_tracking_degraded;
+ 	u8 video_frame_open;
+ 	u8 video_last_pkt_is_frame_end;
+ };
+@@ -169,6 +274,11 @@
+ 					 struct fq_tin *,
+ 					 struct fq_flow *flow);
+ 
++typedef bool fq_flow_guard_t(struct fq *,
++			     struct fq_tin *,
++			     struct fq_flow *,
++			     void *);
++
+ typedef void fq_skb_free_t(struct fq *,
+ 			   struct fq_tin *,
+ 			   struct fq_flow *,
+--- a/include/net/fq_impl.h	2026-05-14 21:11:33.251849842 +0800
++++ b/include/net/fq_impl.h	2026-05-14 21:11:17.508247367 +0800
+@@ -7,6 +7,8 @@
+ #ifndef __NET_SCHED_FQ_IMPL_H
+ #define __NET_SCHED_FQ_IMPL_H
+ 
++#include <linux/ktime.h>
++#include <linux/math64.h>
+ #include <net/fq.h>
+ 
+ /* functions that are embedded into includer */
+@@ -100,20 +102,516 @@
+ 	}
+ }
+ 
++static inline u64 fq_flow_video_quantize_interval(u64 interval)
++{
++	static const u32 fps_modes[] = { 5, 10, 15, 20, 25, 30, 45, 60 };
++	u64 fps;
++	u64 best_diff = ~0ULL;
++	u32 best_fps = 30;
++	int i;
++
++	if (!interval)
++		return FQ_VIDEO_FRAME_INTERVAL_DEFAULT_NS;
++
++	fps = div_u64(1000000000ULL + interval / 2, interval);
++	if (!fps)
++		return FQ_VIDEO_FRAME_INTERVAL_DEFAULT_NS;
++
++	for (i = 0; i < ARRAY_SIZE(fps_modes); i++) {
++		u64 mode = fps_modes[i];
++		u64 diff = fps > mode ? fps - mode : mode - fps;
++
++		if (diff < best_diff) {
++			best_diff = diff;
++			best_fps = fps_modes[i];
++		}
++	}
++
++	return div_u64(1000000000ULL, best_fps);
++}
++
++static inline u64 fq_flow_video_frame_interval(struct fq_flow *flow,
++					       const struct fq_video_pkt_info *info)
++{
++	if (info && info->fixed_frame_interval &&
++	    info->configured_frame_interval_ns)
++		return info->configured_frame_interval_ns;
++
++	if (flow->video_frame_interval_est_ns)
++		return flow->video_frame_interval_est_ns;
++
++	if (info && info->configured_frame_interval_ns)
++		return info->configured_frame_interval_ns;
++
++	return FQ_VIDEO_FRAME_INTERVAL_DEFAULT_NS;
++}
++
++static inline void fq_flow_video_update_interval(struct fq_flow *flow,
++						 const struct fq_video_pkt_info *info,
++						 u64 prev_start_ns,
++						 u64 now)
++{
++	u64 raw_interval;
++
++	if (info && info->fixed_frame_interval)
++		return;
++
++	if (!prev_start_ns || now <= prev_start_ns)
++		return;
++
++	raw_interval = now - prev_start_ns;
++	if (!flow->video_frame_interval_raw_ns)
++		flow->video_frame_interval_raw_ns = raw_interval;
++	else
++		flow->video_frame_interval_raw_ns =
++			(flow->video_frame_interval_raw_ns * 7 + raw_interval) >> 3;
++
++	flow->video_frame_interval_est_ns =
++		fq_flow_video_quantize_interval(flow->video_frame_interval_raw_ns);
++}
++
++static inline u64 fq_flow_video_saturating_add(u64 a, u64 b)
++{
++	if (a > U64_MAX - b)
++		return U64_MAX;
++
++	return a + b;
++}
++
++static inline u64 fq_flow_video_add_clamp(u64 a, u64 b, u64 max,
++						 bool *clamped)
++{
++	u64 sum = fq_flow_video_saturating_add(a, b);
++
++	if (sum > max) {
++		if (clamped)
++			*clamped = true;
++		return max;
++	}
++
++	return sum;
++}
++
++
++static inline u64 fq_flow_video_low_layer_latency(u64 residual)
++{
++	return min_t(u64, residual, FQ_VIDEO_LOW_LAYER_LATENCY_MAX_NS);
++}
++
++static inline void fq_flow_video_store_tail(struct fq_flow *flow,
++					    const struct fq_video_pkt_info *info,
++					    const struct sk_buff *skb,
++					    u64 now)
++{
++	flow->video_last_pkt_ns = now;
++	flow->video_last_pkt_backlog_after_enqueue = flow->backlog;
++	flow->video_last_pkt_enqueue_ns = now;
++	flow->video_last_pkt_len = skb->len;
++}
++
++static inline u64 fq_flow_video_estimate_fq_backlog_delay(struct fq_flow *flow,
++							 const struct fq_video_pkt_info *info,
++							 bool *clamped)
++{
++	u64 tail_backlog_bytes = flow->video_last_pkt_backlog_after_enqueue;
++	u64 frame_queue_bytes = flow->video_frame_queue_bytes ?:
++		flow->video_last_frame_queue_bytes;
++	u64 backlog_bytes;
++	u64 frame_bytes;
++	u64 interval;
++	u64 delay;
++
++	if (clamped)
++		*clamped = false;
++
++	if (!frame_queue_bytes || !tail_backlog_bytes)
++		return 0;
++
++	backlog_bytes = tail_backlog_bytes > frame_queue_bytes ?
++		tail_backlog_bytes - frame_queue_bytes : 0;
++	frame_bytes = flow->video_last_frame_queue_bytes ?:
++		frame_queue_bytes;
++	interval = fq_flow_video_frame_interval(flow, info);
++	delay = mul_u64_u64_div_u64(backlog_bytes, interval, frame_bytes + 1);
++
++	if (delay > FQ_VIDEO_FQ_BACKLOG_DELAY_MAX_NS) {
++		delay = FQ_VIDEO_FQ_BACKLOG_DELAY_MAX_NS;
++		if (clamped)
++			*clamped = true;
++	}
++
++	return delay;
++}
++
++static inline u32 fq_flow_video_add_u32_clamp(u32 a, u32 b)
++{
++	if (a > U32_MAX - b)
++		return U32_MAX;
++
++	return a + b;
++}
++
++static inline u8 fq_flow_video_pending_tail(const struct fq_flow *flow)
++{
++	return (flow->video_pending_frame_head +
++		flow->video_pending_frame_count - 1) % FQ_VIDEO_FRAME_QUEUE_MAX;
++}
++
++static inline bool fq_flow_video_append_frame_segment(struct fq_flow *flow,
++						      u32 frame_id)
++{
++	u8 idx;
++
++	if (flow->video_tracking_degraded)
++		return false;
++
++	if (!frame_id)
++		return false;
++
++	if (flow->video_pending_frame_count >= FQ_VIDEO_FRAME_QUEUE_MAX) {
++		flow->video_tracking_degraded = 1;
++		flow->video_dequeue_frame_guard = 0;
++		flow->video_dequeue_frame_remaining_bytes = 0;
++		flow->video_frame_guard_bytes = 0;
++		return false;
++	}
++
++	idx = (flow->video_pending_frame_head +
++	       flow->video_pending_frame_count) % FQ_VIDEO_FRAME_QUEUE_MAX;
++	flow->video_pending_frame_id[idx] = frame_id;
++	flow->video_pending_frame_bytes[idx] = 0;
++	flow->video_pending_frame_total_bytes[idx] = 0;
++	flow->video_pending_frame_close_ns[idx] = 0;
++	flow->video_pending_frame_pre_ap_latency_ns[idx] = 0;
++	flow->video_pending_frame_fq_backlog_delay_ns[idx] = 0;
++	flow->video_pending_frame_count++;
++
++	return true;
++}
++
++static inline void fq_flow_video_clear_dequeue_frame(struct fq_flow *flow)
++{
++	flow->video_dequeue_frame_id = 0;
++	flow->video_dequeue_frame_guard = 0;
++	flow->video_dequeue_frame_total_bytes = 0;
++	flow->video_dequeue_frame_close_ns = 0;
++	flow->video_dequeue_frame_pre_ap_latency_ns = 0;
++	flow->video_dequeue_frame_fq_backlog_delay_ns = 0;
++	flow->video_frame_guard_bytes = 0;
++}
++
++static inline void fq_flow_video_note_enqueue_bytes(struct fq_flow *flow,
++						    u32 frame_id,
++						    u32 bytes)
++{
++	u8 idx;
++
++	if (!frame_id || !bytes)
++		return;
++
++	if (flow->video_dequeue_frame_id == frame_id) {
++		flow->video_dequeue_frame_remaining_bytes =
++			fq_flow_video_add_u32_clamp(flow->video_dequeue_frame_remaining_bytes,
++						       bytes);
++		flow->video_dequeue_frame_total_bytes =
++			fq_flow_video_add_u32_clamp(flow->video_dequeue_frame_total_bytes,
++						       bytes);
++		if (flow->video_dequeue_frame_guard)
++			flow->video_frame_guard_bytes =
++				fq_flow_video_saturating_add(flow->video_frame_guard_bytes,
++							 bytes);
++		return;
++	}
++
++	if (flow->video_tracking_degraded)
++		return;
++
++	if (!flow->video_pending_frame_count ||
++	    flow->video_pending_frame_id[fq_flow_video_pending_tail(flow)] != frame_id) {
++		if (!fq_flow_video_append_frame_segment(flow, frame_id))
++			return;
++	}
++
++	idx = fq_flow_video_pending_tail(flow);
++	flow->video_pending_frame_bytes[idx] =
++		fq_flow_video_add_u32_clamp(flow->video_pending_frame_bytes[idx], bytes);
++}
++
++static inline u32 fq_flow_video_store_frame_prediction(struct fq_flow *flow,
++						       u32 frame_id,
++						       u64 close_ns,
++						       u64 pre_ap,
++						       u64 fq_backlog_delay,
++						       u32 frame_bytes)
++{
++	u8 i;
++
++	if (!frame_id)
++		return 0;
++
++	if (flow->video_dequeue_frame_id == frame_id &&
++	    flow->video_dequeue_frame_remaining_bytes) {
++		flow->video_dequeue_frame_close_ns = close_ns;
++		flow->video_dequeue_frame_pre_ap_latency_ns = pre_ap;
++		flow->video_dequeue_frame_fq_backlog_delay_ns = fq_backlog_delay;
++		flow->video_dequeue_frame_total_bytes = frame_bytes;
++		return flow->video_dequeue_frame_remaining_bytes;
++	}
++
++	for (i = 0; i < flow->video_pending_frame_count; i++) {
++		u8 idx = (flow->video_pending_frame_head + i) %
++			FQ_VIDEO_FRAME_QUEUE_MAX;
++
++		if (flow->video_pending_frame_id[idx] != frame_id)
++			continue;
++
++		flow->video_pending_frame_close_ns[idx] = close_ns;
++		flow->video_pending_frame_pre_ap_latency_ns[idx] = pre_ap;
++		flow->video_pending_frame_fq_backlog_delay_ns[idx] = fq_backlog_delay;
++		flow->video_pending_frame_total_bytes[idx] = frame_bytes;
++		return flow->video_pending_frame_bytes[idx];
++	}
++
++	return 0;
++}
++
++static inline bool fq_flow_video_load_dequeue_frame(struct fq_flow *flow)
++{
++	u8 idx;
++
++	if (flow->video_dequeue_frame_remaining_bytes)
++		return true;
++
++	flow->video_dequeue_frame_id = 0;
++	flow->video_dequeue_frame_guard = 0;
++	flow->video_dequeue_frame_total_bytes = 0;
++	flow->video_dequeue_frame_close_ns = 0;
++	flow->video_dequeue_frame_pre_ap_latency_ns = 0;
++	flow->video_dequeue_frame_fq_backlog_delay_ns = 0;
++	flow->video_frame_guard_bytes = 0;
++
++	if (!flow->video_pending_frame_count)
++		return false;
++
++	idx = flow->video_pending_frame_head;
++	flow->video_dequeue_frame_id = flow->video_pending_frame_id[idx];
++	flow->video_dequeue_frame_remaining_bytes =
++		flow->video_pending_frame_bytes[idx];
++	flow->video_dequeue_frame_total_bytes =
++		flow->video_pending_frame_total_bytes[idx];
++	flow->video_dequeue_frame_close_ns =
++		flow->video_pending_frame_close_ns[idx];
++	flow->video_dequeue_frame_pre_ap_latency_ns =
++		flow->video_pending_frame_pre_ap_latency_ns[idx];
++	flow->video_dequeue_frame_fq_backlog_delay_ns =
++		flow->video_pending_frame_fq_backlog_delay_ns[idx];
++	flow->video_dequeue_frame_guard = 0;
++
++	flow->video_pending_frame_id[idx] = 0;
++	flow->video_pending_frame_bytes[idx] = 0;
++	flow->video_pending_frame_total_bytes[idx] = 0;
++	flow->video_pending_frame_close_ns[idx] = 0;
++	flow->video_pending_frame_pre_ap_latency_ns[idx] = 0;
++	flow->video_pending_frame_fq_backlog_delay_ns[idx] = 0;
++	flow->video_pending_frame_head =
++		(flow->video_pending_frame_head + 1) % FQ_VIDEO_FRAME_QUEUE_MAX;
++	flow->video_pending_frame_count--;
++
++	return true;
++}
++
++static inline void fq_flow_video_account_remove_bytes(struct fq_flow *flow,
++						      u32 bytes)
++{
++	if (!bytes || !fq_flow_is_video(flow))
++		return;
++
++	fq_flow_video_load_dequeue_frame(flow);
++	if (!flow->video_dequeue_frame_remaining_bytes)
++		return;
++
++	if (flow->video_dequeue_frame_remaining_bytes > bytes)
++		flow->video_dequeue_frame_remaining_bytes -= bytes;
++	else
++		flow->video_dequeue_frame_remaining_bytes = 0;
++
++	if (flow->video_frame_guard_bytes > bytes)
++		flow->video_frame_guard_bytes -= bytes;
++	else
++		flow->video_frame_guard_bytes = 0;
++
++	if (!flow->video_dequeue_frame_remaining_bytes)
++		fq_flow_video_clear_dequeue_frame(flow);
++}
++
++static inline void fq_flow_video_mark_degraded(struct fq_flow *flow)
++{
++	if (!fq_flow_is_video(flow))
++		return;
++
++	flow->video_tracking_degraded = 1;
++	flow->video_dequeue_frame_guard = 0;
++	flow->video_dequeue_frame_remaining_bytes = 0;
++	flow->video_frame_guard_bytes = 0;
++	flow->video_guard_budget_bytes = 0;
++}
++
++static inline bool fq_flow_video_guard_active_at(struct fq_flow *flow,
++						 struct fq_video_dequeue_info *info)
++{
++	u64 now = info ? info->now_ns : ktime_get_ns();
++	u64 fq_wait = 0;
++	u64 low_layer_latency;
++	u64 post_ap_proxy;
++	u64 latency;
++	u64 threshold = info ? info->latency_high_ns : 0;
++	bool clamped = false;
++
++	if (!fq_flow_is_video(flow))
++		return false;
++
++	if (flow->video_tracking_degraded)
++		return false;
++
++	fq_flow_video_load_dequeue_frame(flow);
++	if (!flow->video_dequeue_frame_remaining_bytes)
++		return false;
++
++	if (flow->video_dequeue_frame_close_ns &&
++	    now > flow->video_dequeue_frame_close_ns)
++		fq_wait = now - flow->video_dequeue_frame_close_ns;
++	else
++		fq_wait = flow->video_dequeue_frame_fq_backlog_delay_ns;
++
++	low_layer_latency = fq_flow_video_low_layer_latency(
++		info ? info->low_layer_latency_ns : 0);
++	post_ap_proxy = fq_flow_video_add_clamp(fq_wait, low_layer_latency,
++						 FQ_VIDEO_POST_AP_PROXY_MAX_NS,
++						 &clamped);
++	latency = fq_flow_video_saturating_add(
++		flow->video_dequeue_frame_pre_ap_latency_ns, post_ap_proxy);
++
++	flow->video_last_dequeue_fq_wait_ns = fq_wait;
++	flow->video_last_dequeue_low_layer_latency_ns = low_layer_latency;
++	flow->video_last_dequeue_post_ap_proxy_ns = post_ap_proxy;
++	flow->video_last_dequeue_experiment_latency_ns = latency;
++
++	if (!flow->video_frame_guard_bytes && threshold && latency >= threshold) {
++		flow->video_dequeue_frame_guard = 1;
++		flow->video_frame_guard_bytes =
++			flow->video_dequeue_frame_remaining_bytes;
++		flow->video_guard_budget_bytes =
++			min_t(u32, flow->video_dequeue_frame_remaining_bytes,
++			      flow->video_dequeue_frame_total_bytes ?:
++			      flow->video_dequeue_frame_remaining_bytes);
++		flow->video_last_frame_guard_bytes = flow->video_frame_guard_bytes;
++	}
++
++	return flow->video_frame_guard_bytes && flow->video_guard_budget_bytes;
++}
++
++static inline bool fq_flow_video_guard_account_dequeue(struct fq_flow *flow,
++						       struct fq_video_dequeue_info *info,
++						       const struct sk_buff *skb)
++{
++	bool guarded;
++	bool guard_start;
++
++	flow->video_frame_guard_last_dequeue = 0;
++	if (!fq_flow_is_video(flow))
++		return false;
++
++	guarded = fq_flow_video_guard_active_at(flow, info);
++	guard_start = guarded && flow->video_frame_guard_bytes ==
++		flow->video_dequeue_frame_remaining_bytes;
++	flow->video_frame_guard_last_dequeue = guard_start ? 2 : guarded;
++
++	if (flow->video_dequeue_frame_remaining_bytes > skb->len)
++		flow->video_dequeue_frame_remaining_bytes -= skb->len;
++	else
++		flow->video_dequeue_frame_remaining_bytes = 0;
++
++	if (guarded) {
++		if (flow->video_guard_budget_bytes > skb->len)
++			flow->video_guard_budget_bytes -= skb->len;
++		else
++			flow->video_guard_budget_bytes = 0;
++
++		if (flow->video_frame_guard_bytes > skb->len)
++			flow->video_frame_guard_bytes -= skb->len;
++		else
++			flow->video_frame_guard_bytes = 0;
++	}
++
++	if (!flow->video_dequeue_frame_remaining_bytes) {
++		flow->video_dequeue_frame_id = 0;
++		flow->video_dequeue_frame_guard = 0;
++		flow->video_dequeue_frame_total_bytes = 0;
++		flow->video_dequeue_frame_close_ns = 0;
++		flow->video_dequeue_frame_pre_ap_latency_ns = 0;
++		flow->video_dequeue_frame_fq_backlog_delay_ns = 0;
++		flow->video_frame_guard_bytes = 0;
++		flow->video_guard_budget_bytes = 0;
++	}
++
++	return guarded;
++}
++
+ static inline void fq_flow_video_reset(struct fq_flow *flow)
+ {
++	int i;
++
+ 	flow->video_frame_id = 0;
+ 	flow->video_frame_packets = 0;
+ 	flow->video_frame_bytes = 0;
+ 	flow->video_frame_size_bucket = 0;
++	flow->video_frame_queue_bytes = 0;
+ 	flow->video_frame_mode = FQ_VIDEO_FRAME_MODE_UNKNOWN;
+ 	flow->video_frame_mode_hits = 0;
+ 	flow->video_last_frame_packets = 0;
+ 	flow->video_last_frame_bytes = 0;
++	flow->video_last_frame_queue_bytes = 0;
+ 	flow->video_frame_start_ns = 0;
+ 	flow->video_last_pkt_ns = 0;
+ 	flow->video_last_frame_end_ns = 0;
+ 	flow->video_last_frame_interval_ns = 0;
++	flow->video_frame_ideal_start_ns = 0;
++	flow->video_frame_interval_raw_ns = 0;
++	flow->video_frame_interval_est_ns = 0;
++	flow->video_last_pre_ap_latency_ns = 0;
++	flow->video_last_fq_backlog_delay_ns = 0;
++	flow->video_last_low_layer_latency_ns = 0;
++	flow->video_last_post_ap_proxy_ns = 0;
++	flow->video_last_experiment_latency_ns = 0;
++	flow->video_last_dequeue_fq_wait_ns = 0;
++	flow->video_last_dequeue_low_layer_latency_ns = 0;
++	flow->video_last_dequeue_post_ap_proxy_ns = 0;
++	flow->video_last_dequeue_experiment_latency_ns = 0;
++	for (i = 0; i < FQ_VIDEO_FRAME_QUEUE_MAX; i++) {
++		flow->video_pending_frame_id[i] = 0;
++		flow->video_pending_frame_bytes[i] = 0;
++		flow->video_pending_frame_total_bytes[i] = 0;
++		flow->video_pending_frame_close_ns[i] = 0;
++		flow->video_pending_frame_pre_ap_latency_ns[i] = 0;
++		flow->video_pending_frame_fq_backlog_delay_ns[i] = 0;
++	}
++	flow->video_pending_frame_head = 0;
++	flow->video_pending_frame_count = 0;
++	flow->video_dequeue_frame_id = 0;
++	flow->video_dequeue_frame_remaining_bytes = 0;
++	flow->video_dequeue_frame_total_bytes = 0;
++	flow->video_dequeue_frame_close_ns = 0;
++	flow->video_dequeue_frame_pre_ap_latency_ns = 0;
++	flow->video_dequeue_frame_fq_backlog_delay_ns = 0;
++	flow->video_dequeue_frame_guard = 0;
++	flow->video_frame_guard_bytes = 0;
++	flow->video_guard_budget_bytes = 0;
++	flow->video_last_frame_guard_bytes = 0;
++	flow->video_last_pkt_backlog_after_enqueue = 0;
++	flow->video_last_pkt_enqueue_ns = 0;
++	flow->video_last_pkt_len = 0;
++	flow->video_frame_guard_last_dequeue = 0;
++	flow->video_tracking_degraded = 0;
+ 	flow->video_frame_open = 0;
+ 	flow->video_last_pkt_is_frame_end = 0;
+ }
+@@ -122,33 +670,98 @@
+ 					     const struct fq_video_pkt_info *info,
+ 					     u64 now)
+ {
++	u64 prev_start_ns = flow->video_frame_start_ns;
++	u64 prev_ideal_start_ns = flow->video_frame_ideal_start_ns;
++	u64 interval;
++	u64 candidate;
++
++	fq_flow_video_update_interval(flow, info, prev_start_ns, now);
++	interval = fq_flow_video_frame_interval(flow, info);
++	candidate = prev_ideal_start_ns ? prev_ideal_start_ns + interval : now;
++
+ 	flow->video_frame_id++;
+ 	flow->video_frame_packets = 0;
+ 	flow->video_frame_bytes = 0;
++	flow->video_frame_queue_bytes = 0;
+ 	flow->video_frame_size_bucket = info->size_bucket;
+ 	flow->video_frame_start_ns = now;
++	flow->video_frame_ideal_start_ns = min(candidate, now);
+ 	flow->video_frame_open = 1;
+ 	flow->video_last_pkt_is_frame_end = 0;
+ }
+ 
+-static inline void fq_flow_video_complete_frame(struct fq_flow *flow,
+-						 u64 now)
+-{
++static inline u8 fq_flow_video_complete_frame(struct fq_flow *flow,
++					      struct fq_video_pkt_info *info,
++					      u64 now)
++{
++	u64 pre_ap = 0;
++	u64 fq_backlog_delay;
++	u64 low_layer_latency;
++	u64 post_ap_proxy;
++	u64 experiment_latency;
++	bool fq_clamped = false;
++	bool post_ap_clamped = false;
++	u8 event = FQ_VIDEO_FRAME_EVENT_NONE;
++
+ 	flow->video_last_frame_packets = flow->video_frame_packets;
+ 	flow->video_last_frame_bytes = flow->video_frame_bytes;
+-	if (flow->video_last_frame_end_ns)
+-		flow->video_last_frame_interval_ns =
+-			now - flow->video_last_frame_end_ns;
++	flow->video_last_frame_queue_bytes = flow->video_frame_queue_bytes;
++	if (flow->video_last_frame_end_ns && now > flow->video_last_frame_end_ns)
++		flow->video_last_frame_interval_ns = now - flow->video_last_frame_end_ns;
+ 	flow->video_last_frame_end_ns = now;
++
++	if (flow->video_frame_ideal_start_ns && now > flow->video_frame_ideal_start_ns)
++		pre_ap = now - flow->video_frame_ideal_start_ns;
++	fq_backlog_delay = fq_flow_video_estimate_fq_backlog_delay(flow, info,
++								 &fq_clamped);
++	low_layer_latency = fq_flow_video_low_layer_latency(
++		info ? info->low_layer_latency_ns : 0);
++	post_ap_proxy = fq_flow_video_add_clamp(fq_backlog_delay,
++						 low_layer_latency,
++						 FQ_VIDEO_POST_AP_PROXY_MAX_NS,
++						 &post_ap_clamped);
++	experiment_latency = fq_flow_video_saturating_add(pre_ap, post_ap_proxy);
++
++	flow->video_last_pre_ap_latency_ns = pre_ap;
++	flow->video_last_fq_backlog_delay_ns = fq_backlog_delay;
++	flow->video_last_low_layer_latency_ns = low_layer_latency;
++	flow->video_last_post_ap_proxy_ns = post_ap_proxy;
++	flow->video_last_experiment_latency_ns = experiment_latency;
++
++	if (info) {
++		info->estimated_frame_interval_ns =
++			fq_flow_video_frame_interval(flow, info);
++		info->pre_ap_latency_ns = pre_ap;
++		info->fq_backlog_delay_ns = fq_backlog_delay;
++		info->post_ap_proxy_ns = post_ap_proxy;
++		info->experiment_latency_ns = experiment_latency;
++		fq_flow_video_store_frame_prediction(flow, flow->video_frame_id,
++							 now, pre_ap, fq_backlog_delay,
++							 flow->video_last_frame_queue_bytes);
++		if (info->latency_high_ns && experiment_latency >= info->latency_high_ns)
++			event |= FQ_VIDEO_FRAME_EVENT_HIGH_LATENCY;
++	}
++	if (fq_clamped)
++		event |= FQ_VIDEO_FRAME_EVENT_FQ_BACKLOG_CLAMPED;
++	if (post_ap_clamped)
++		event |= FQ_VIDEO_FRAME_EVENT_POST_AP_CLAMPED;
++
+ 	flow->video_frame_open = 0;
+ 	flow->video_last_pkt_is_frame_end = 1;
++
++	return event | FQ_VIDEO_FRAME_EVENT_LATENCY_ESTIMATED;
+ }
+ 
+ static inline u8 fq_flow_video_update(struct fq_flow *flow,
+-				      const struct fq_video_pkt_info *info,
++				      struct fq_video_pkt_info *info,
+ 				      const struct sk_buff *skb)
+ {
+ 	u8 event = FQ_VIDEO_FRAME_EVENT_NONE;
++	if (flow->video_tracking_degraded && info && skb) {
++		fq_flow_video_store_tail(flow, info, skb,
++					 info ? info->enqueue_time_ns : 0);
++		return event;
++	}
+ 	u64 now;
+ 	u32 bytes;
+ 	bool avg_boundary = false;
+@@ -175,20 +796,20 @@
+ 		}
+ 
+ 		if (avg_boundary) {
+-			fq_flow_video_complete_frame(flow,
+-				flow->video_last_pkt_ns ?: now);
++			event |= fq_flow_video_complete_frame(flow, info,
++				flow->video_last_pkt_enqueue_ns ?: flow->video_last_pkt_ns ?: now);
+ 			fq_flow_video_note_mode(flow, FQ_VIDEO_FRAME_MODE_AVG);
+ 			event |= FQ_VIDEO_FRAME_EVENT_AVG_BOUNDARY;
+ 		} else if (!last_boundary) {
+ 			if (flow->video_frame_packets >= FQ_VIDEO_FRAME_MAX_PACKETS) {
+-				fq_flow_video_complete_frame(flow,
+-					flow->video_last_pkt_ns ?: now);
++				event |= fq_flow_video_complete_frame(flow, info,
++					flow->video_last_pkt_enqueue_ns ?: flow->video_last_pkt_ns ?: now);
+ 				event |= FQ_VIDEO_FRAME_EVENT_FALLBACK_PACKETS;
+ 			} else if (flow->video_frame_start_ns &&
+ 				   now - flow->video_frame_start_ns >=
+ 				   FQ_VIDEO_FRAME_TIMEOUT_NS) {
+-				fq_flow_video_complete_frame(flow,
+-					flow->video_last_pkt_ns ?: now);
++				event |= fq_flow_video_complete_frame(flow, info,
++					flow->video_last_pkt_enqueue_ns ?: flow->video_last_pkt_ns ?: now);
+ 				event |= FQ_VIDEO_FRAME_EVENT_FALLBACK_TIMEOUT;
+ 			}
+ 		}
+@@ -199,10 +820,12 @@
+ 
+ 	flow->video_frame_packets++;
+ 	flow->video_frame_bytes += bytes;
+-	flow->video_last_pkt_ns = now;
++	flow->video_frame_queue_bytes += skb->len;
++	fq_flow_video_note_enqueue_bytes(flow, flow->video_frame_id, skb->len);
++	fq_flow_video_store_tail(flow, info, skb, now);
+ 
+ 	if (last_boundary) {
+-		fq_flow_video_complete_frame(flow, now);
++		event |= fq_flow_video_complete_frame(flow, info, now);
+ 		fq_flow_video_note_mode(flow, FQ_VIDEO_FRAME_MODE_LAST);
+ 		event |= FQ_VIDEO_FRAME_EVENT_LAST_BOUNDARY;
+ 	}
+@@ -244,7 +870,8 @@
+ }
+ 
+ static struct sk_buff *fq_flow_dequeue(struct fq *fq,
+-				       struct fq_flow *flow)
++				       struct fq_flow *flow,
++				       struct fq_video_dequeue_info *video_info)
+ {
+ 	struct sk_buff *skb;
+ 
+@@ -254,6 +893,9 @@
+ 	if (!skb)
+ 		return NULL;
+ 
++	if (video_info)
++		video_info->flow = flow;
++	fq_flow_video_guard_account_dequeue(flow, video_info, skb);
+ 	fq_adjust_removal(fq, flow, skb);
+ 
+ 	return skb;
+@@ -278,6 +906,7 @@
+ 		packets++;
+ 		bytes += skb->len;
+ 		truesize += skb->truesize;
++		fq_flow_video_account_remove_bytes(flow, skb->len);
+ 		free_func(fq, tin, flow, skb);
+ 	} while (packets < pending);
+ 
+@@ -288,7 +917,9 @@
+ 
+ static struct sk_buff *fq_tin_dequeue(struct fq *fq,
+ 				      struct fq_tin *tin,
+-				      fq_tin_dequeue_t dequeue_func)
++				      fq_tin_dequeue_t dequeue_func,
++				      fq_flow_guard_t guard_func,
++				      void *guard_data)
+ {
+ 	struct fq_flow *flow;
+ 	struct list_head *head;
+@@ -306,7 +937,12 @@
+ 
+ 	flow = list_first_entry(head, struct fq_flow, flowchain);
+ 
+-	if (flow->deficit <= 0) {
++	if (fq_flow_is_video(flow) && flow->video_tracking_degraded &&
++	    !flow->backlog)
++		fq_flow_video_reset(flow);
++
++	if (flow->deficit <= 0 &&
++	    !(guard_func && guard_func(fq, tin, flow, guard_data))) {
+ 		flow->deficit += fq_flow_quantum(fq, flow);
+ 		list_move_tail(&flow->flowchain, head == &tin->new_flows ?
+ 			       fq_flow_old_list(tin, flow) : head);
+@@ -331,7 +967,8 @@
+ 	if (head != &tin->new_flows)
+ 		fq_tin_next_old_head(tin, head);
+ 
+-	flow->deficit -= skb->len;
++	if (!flow->video_frame_guard_last_dequeue)
++		flow->deficit -= skb->len;
+ 	tin->tx_bytes += skb->len;
+ 	tin->tx_packets++;
+ 
+@@ -402,7 +1039,7 @@
+ 				    struct fq_tin *tin, u32 idx,
+ 				    struct sk_buff *skb,
+ 				    bool is_video,
+-				    const struct fq_video_pkt_info *video_info,
++				    struct fq_video_pkt_info *video_info,
+ 				    fq_skb_free_t free_func)
+ {
+ 	struct fq_flow *flow;
+@@ -499,6 +1136,15 @@
+ 		__skb_unlink(skb, &flow->queue);
+ 		fq_adjust_removal(fq, flow, skb);
+ 		free_func(fq, tin, flow, skb);
++		if (fq_flow_is_video(flow)) {
++			flow->video_tracking_degraded = 1;
++			flow->video_dequeue_frame_guard = 0;
++			flow->video_dequeue_frame_remaining_bytes = 0;
++			flow->video_frame_guard_bytes = 0;
++			flow->video_guard_budget_bytes = 0;
++			if (!flow->backlog)
++				fq_flow_video_reset(flow);
++		}
+ 	}
+ }
+ 
+@@ -527,7 +1173,7 @@
+ 	struct fq_tin *tin = flow->tin;
+ 	struct sk_buff *skb;
+ 
+-	while ((skb = fq_flow_dequeue(fq, flow)))
++	while ((skb = fq_flow_dequeue(fq, flow, NULL)))
+ 		free_func(fq, tin, flow, skb);
+ 
+ 	if (!list_empty(&flow->flowchain)) {
+--- a/include/net/mac80211.h	2026-05-14 21:11:33.230129557 +0800
++++ b/include/net/mac80211.h	2026-05-14 21:06:31.832684603 +0800
+@@ -997,6 +997,8 @@
+  * @IEEE80211_TX_CTRL_DONT_USE_RATE_MASK: Don't use rate mask for this frame
+  *	which is transmitted due to scanning or offchannel TX, not in normal
+  *	operation on the interface.
++ * @IEEE80211_TX_CTRL_VIDEO_FLOW: internal mac80211 marker for frames that
++ *	were dequeued from a configured video flow.
+  * @IEEE80211_TX_CTRL_MLO_LINK: If not @IEEE80211_LINK_UNSPECIFIED, this
+  *	frame should be transmitted on the specific link. This really is
+  *	only relevant for frames that do not have data present, and is
+@@ -1018,6 +1020,7 @@
+ 	IEEE80211_TX_CTRL_DONT_REORDER		= BIT(8),
+ 	IEEE80211_TX_CTRL_MCAST_MLO_FIRST_TX	= BIT(9),
+ 	IEEE80211_TX_CTRL_DONT_USE_RATE_MASK	= BIT(10),
++	IEEE80211_TX_CTRL_VIDEO_FLOW		= BIT(11),
+ 	IEEE80211_TX_CTRL_MLO_LINK		= 0xf0000000,
+ };
+ 
+@@ -5355,6 +5358,19 @@
+ 			     struct sk_buff *skb);
+ 
+ /**
++ * ieee80211_video_low_layer_latency_report - report driver-measured low-layer TX latency
++ *
++ * @hw: hardware that observed the TX completion/free event
++ * @latency_ns: driver-visible low-layer latency sample in nanoseconds
++ *
++ * Drivers can call this with a low-layer TX latency sample, for example a
++ * DMA-ring-install to TXFREE interval. mac80211 keeps an EWMA and uses it as
++ * the low-layer component of the experimental video frame latency estimator.
++ */
++void ieee80211_video_low_layer_latency_report(struct ieee80211_hw *hw,
++					      u64 latency_ns);
++
++/**
+  * ieee80211_tx_status_ext - extended transmit status callback
+  *
+  * This function can be used as a replacement for ieee80211_tx_status_skb()
+--- a/net/mac80211/debugfs.c	2026-05-14 21:11:33.251997721 +0800
++++ b/net/mac80211/debugfs.c	2026-05-14 21:06:31.832812733 +0800
+@@ -202,15 +202,144 @@
+ 	.llseek = default_llseek,
+ };
+ 
++static ssize_t video_frame_interval_us_read(struct file *file,
++					    char __user *user_buf,
++					    size_t count,
++					    loff_t *ppos)
++{
++	struct ieee80211_local *local = file->private_data;
++	char buf[24];
++	u64 interval_us = 0;
++	int len;
++
++	if (READ_ONCE(local->video_frame_interval_fixed))
++		interval_us = div_u64(READ_ONCE(local->video_frame_interval_ns),
++				      NSEC_PER_USEC);
++	len = scnprintf(buf, sizeof(buf), "%llu\n",
++			(unsigned long long)interval_us);
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t video_frame_interval_us_write(struct file *file,
++					     const char __user *user_buf,
++					     size_t count,
++					     loff_t *ppos)
++{
++	struct ieee80211_local *local = file->private_data;
++	char buf[24];
++	u64 interval_us;
++
++	if (count >= sizeof(buf))
++		return -EINVAL;
++
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++
++	if (count && buf[count - 1] == '\n')
++		buf[count - 1] = '\0';
++	else
++		buf[count] = '\0';
++
++	if (kstrtou64(buf, 0, &interval_us))
++		return -EINVAL;
++
++	if (interval_us && (interval_us < 1000 || interval_us > 1000000))
++		return -EINVAL;
++
++	if (interval_us) {
++		WRITE_ONCE(local->video_frame_interval_ns,
++			   interval_us * NSEC_PER_USEC);
++		WRITE_ONCE(local->video_frame_interval_fixed, true);
++	} else {
++		WRITE_ONCE(local->video_frame_interval_ns,
++			   FQ_VIDEO_FRAME_INTERVAL_DEFAULT_NS);
++		WRITE_ONCE(local->video_frame_interval_fixed, false);
++	}
++
++	return count;
++}
++
++static const struct file_operations video_frame_interval_us_ops = {
++	.write = video_frame_interval_us_write,
++	.read = video_frame_interval_us_read,
++	.open = simple_open,
++	.llseek = default_llseek,
++};
++
++static ssize_t video_latency_high_us_read(struct file *file,
++					  char __user *user_buf,
++					  size_t count,
++					  loff_t *ppos)
++{
++	struct ieee80211_local *local = file->private_data;
++	char buf[24];
++	int len;
++
++	len = scnprintf(buf, sizeof(buf), "%llu\n",
++			(unsigned long long)div_u64(
++				READ_ONCE(local->video_latency_high_ns),
++				NSEC_PER_USEC));
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t video_latency_high_us_write(struct file *file,
++					   const char __user *user_buf,
++					   size_t count,
++					   loff_t *ppos)
++{
++	struct ieee80211_local *local = file->private_data;
++	char buf[24];
++	u64 latency_us;
++
++	if (count >= sizeof(buf))
++		return -EINVAL;
++
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++
++	if (count && buf[count - 1] == '\n')
++		buf[count - 1] = '\0';
++	else
++		buf[count] = '\0';
++
++	if (kstrtou64(buf, 0, &latency_us))
++		return -EINVAL;
++
++	if (latency_us > 1000000)
++		return -EINVAL;
++
++	WRITE_ONCE(local->video_latency_high_ns,
++		   latency_us * NSEC_PER_USEC);
++
++	return count;
++}
++
++static const struct file_operations video_latency_high_us_ops = {
++	.write = video_latency_high_us_write,
++	.read = video_latency_high_us_read,
++	.open = simple_open,
++	.llseek = default_llseek,
++};
++
+ static ssize_t video_frame_stats_read(struct file *file,
+ 				      char __user *user_buf,
+ 				      size_t count,
+ 				      loff_t *ppos)
+ {
+ 	struct ieee80211_local *local = file->private_data;
+-	char buf[512];
++	struct {
++		char buf[4096];
++	} *bufp;
++	ssize_t ret;
+ 	int len = 0;
+ 
++	bufp = vzalloc(sizeof(*bufp));
++	if (!bufp)
++		return -ENOMEM;
++#define buf (bufp->buf)
++
+ 	len += scnprintf(buf + len, sizeof(buf) - len,
+ 			 "video_flow_port=%u\n",
+ 			 READ_ONCE(local->video_flow_port));
+@@ -229,8 +358,97 @@
+ 	len += scnprintf(buf + len, sizeof(buf) - len,
+ 			 "video_frame_fallback_timeout=%lld\n",
+ 			 (long long)atomic64_read(&local->video_frame_fallback_timeout));
+-
+-	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_frame_interval_mode=%s\n",
++			 READ_ONCE(local->video_frame_interval_fixed) ?
++			 "fixed" : "auto");
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_frame_interval_us=%llu\n",
++			 (unsigned long long)div_u64(
++				READ_ONCE(local->video_frame_interval_ns),
++				NSEC_PER_USEC));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_latency_high_us=%llu\n",
++			 (unsigned long long)div_u64(
++				READ_ONCE(local->video_latency_high_ns),
++				NSEC_PER_USEC));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_frame_latency_estimated=%lld\n",
++			 (long long)atomic64_read(&local->video_frame_latency_estimated));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_frame_latency_high=%lld\n",
++			 (long long)atomic64_read(&local->video_frame_latency_high));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_fq_backlog_delay_clamped=%lld\n",
++			 (long long)atomic64_read(&local->video_fq_backlog_delay_clamped));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_post_ap_proxy_clamped=%lld\n",
++			 (long long)atomic64_read(&local->video_post_ap_proxy_clamped));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_frame_guard_started=%lld\n",
++			 (long long)atomic64_read(&local->video_frame_guard_started));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_frame_guard_dequeue_packets=%lld\n",
++			 (long long)atomic64_read(&local->video_frame_guard_dequeue_packets));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_last_frame_guard_bytes=%lld\n",
++			 (long long)atomic64_read(&local->video_last_frame_guard_bytes));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_last_est_frame_interval_us=%lld\n",
++			 (long long)div_s64(atomic64_read(&local->video_last_est_frame_interval_ns),
++					    NSEC_PER_USEC));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_last_pre_ap_latency_us=%lld\n",
++			 (long long)div_s64(atomic64_read(&local->video_last_pre_ap_latency_ns),
++					    NSEC_PER_USEC));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_last_fq_backlog_delay_us=%lld\n",
++			 (long long)div_s64(atomic64_read(&local->video_last_fq_backlog_delay_ns),
++					    NSEC_PER_USEC));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_last_low_layer_latency_us=%lld\n",
++			 (long long)div_s64(atomic64_read(&local->video_last_low_layer_latency_ns),
++					    NSEC_PER_USEC));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_last_post_ap_proxy_us=%lld\n",
++			 (long long)div_s64(atomic64_read(&local->video_last_post_ap_proxy_ns),
++					    NSEC_PER_USEC));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_last_experiment_latency_us=%lld\n",
++			 (long long)div_s64(atomic64_read(&local->video_last_experiment_latency_ns),
++					    NSEC_PER_USEC));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_last_dequeue_fq_wait_us=%lld\n",
++			 (long long)div_s64(atomic64_read(&local->video_last_dequeue_fq_wait_ns),
++					    NSEC_PER_USEC));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_last_dequeue_low_layer_latency_us=%lld\n",
++			 (long long)div_s64(atomic64_read(&local->video_last_dequeue_low_layer_latency_ns),
++					    NSEC_PER_USEC));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_last_dequeue_post_ap_proxy_us=%lld\n",
++			 (long long)div_s64(atomic64_read(&local->video_last_dequeue_post_ap_proxy_ns),
++					    NSEC_PER_USEC));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_last_dequeue_experiment_latency_us=%lld\n",
++			 (long long)div_s64(atomic64_read(&local->video_last_dequeue_experiment_latency_ns),
++					    NSEC_PER_USEC));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_low_layer_latency_us=%lld\n",
++			 (long long)div_s64(atomic64_read(&local->video_low_layer_latency_ns),
++					    NSEC_PER_USEC));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_low_layer_latency_samples=%lld\n",
++			 (long long)atomic64_read(&local->video_low_layer_latency_samples));
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "video_last_low_layer_latency_sample_us=%lld\n",
++			 (long long)div_s64(atomic64_read(&local->video_last_low_layer_latency_sample_ns),
++					    NSEC_PER_USEC));
++
++	ret = simple_read_from_buffer(user_buf, count, ppos, buf, len);
++	vfree(bufp);
++#undef buf
++	return ret;
+ }
+ 
+ static const struct file_operations video_frame_stats_ops = {
+@@ -808,6 +1042,8 @@
+ 	DEBUGFS_ADD(aql_pending);
+ 	DEBUGFS_ADD_MODE(aqm, 0600);
+ 	DEBUGFS_ADD_MODE(video_flow_port, 0600);
++	DEBUGFS_ADD_MODE(video_frame_interval_us, 0600);
++	DEBUGFS_ADD_MODE(video_latency_high_us, 0600);
+ 	DEBUGFS_ADD(video_frame_stats);
+ 
+ 	DEBUGFS_ADD_MODE(airtime_flags, 0600);
+--- a/net/mac80211/ieee80211_i.h	2026-05-14 21:11:33.252219571 +0800
++++ b/net/mac80211/ieee80211_i.h	2026-05-14 21:06:31.833065283 +0800
+@@ -928,6 +928,7 @@
+ 	struct fq_tin tin;
+ 	struct codel_vars def_cvars;
+ 	struct codel_stats cstats;
++	struct fq_video_dequeue_info *video_dequeue_info;
+ 
+ 	u16 schedule_round;
+ 	struct list_head schedule_order;
+@@ -1356,6 +1357,7 @@
+ 
+ DECLARE_STATIC_KEY_FALSE(aql_disable);
+ 
++
+ struct ieee80211_local {
+ 	/* embed the driver visible part.
+ 	 * don't cast (use the static inlines below), but we keep
+@@ -1383,11 +1385,36 @@
+ 	atomic_t aql_bc_pending_airtime;
+ 	atomic_t aql_ac_pending_airtime[IEEE80211_NUM_ACS];
+ 	u16 video_flow_port;
++	u64 video_frame_interval_ns;
++	bool video_frame_interval_fixed;
++	u64 video_latency_high_ns;
+ 	atomic64_t video_size_packets;
+ 	atomic64_t video_frame_avg_boundaries;
+ 	atomic64_t video_frame_last_boundaries;
+ 	atomic64_t video_frame_fallback_packets;
+ 	atomic64_t video_frame_fallback_timeout;
++	atomic64_t video_frame_latency_estimated;
++	atomic64_t video_frame_latency_high;
++	atomic64_t video_fq_backlog_delay_clamped;
++	atomic64_t video_post_ap_proxy_clamped;
++	atomic64_t video_frame_guard_started;
++	atomic64_t video_frame_guard_dequeue_packets;
++	atomic64_t video_last_frame_guard_bytes;
++	atomic64_t video_last_est_frame_interval_ns;
++	atomic64_t video_last_pre_ap_latency_ns;
++	atomic64_t video_last_fq_backlog_delay_ns;
++	atomic64_t video_last_low_layer_latency_ns;
++	atomic64_t video_last_post_ap_proxy_ns;
++	atomic64_t video_last_experiment_latency_ns;
++	atomic64_t video_last_dequeue_fq_wait_ns;
++	atomic64_t video_last_dequeue_low_layer_latency_ns;
++	atomic64_t video_last_dequeue_post_ap_proxy_ns;
++	atomic64_t video_last_dequeue_experiment_latency_ns;
++	atomic64_t video_last_flow_idx;
++	atomic64_t video_last_tid;
++	atomic64_t video_low_layer_latency_ns;
++	atomic64_t video_low_layer_latency_samples;
++	atomic64_t video_last_low_layer_latency_sample_ns;
+ 
+ 	const struct ieee80211_ops *ops;
+ 
+--- a/net/mac80211/main.c	2026-05-14 21:11:33.252405711 +0800
++++ b/net/mac80211/main.c	2026-05-14 21:06:31.833239883 +0800
+@@ -968,11 +968,36 @@
+ 	local->aql_threshold = IEEE80211_AQL_THRESHOLD;
+ 	atomic_set(&local->aql_total_pending_airtime, 0);
+ 	local->video_flow_port = 12344;
++	local->video_frame_interval_ns = FQ_VIDEO_FRAME_INTERVAL_DEFAULT_NS;
++	local->video_frame_interval_fixed = false;
++	local->video_latency_high_ns = 50000000ULL;
+ 	atomic64_set(&local->video_size_packets, 0);
+ 	atomic64_set(&local->video_frame_avg_boundaries, 0);
+ 	atomic64_set(&local->video_frame_last_boundaries, 0);
+ 	atomic64_set(&local->video_frame_fallback_packets, 0);
+ 	atomic64_set(&local->video_frame_fallback_timeout, 0);
++	atomic64_set(&local->video_frame_latency_estimated, 0);
++	atomic64_set(&local->video_frame_latency_high, 0);
++	atomic64_set(&local->video_fq_backlog_delay_clamped, 0);
++	atomic64_set(&local->video_post_ap_proxy_clamped, 0);
++	atomic64_set(&local->video_frame_guard_started, 0);
++	atomic64_set(&local->video_frame_guard_dequeue_packets, 0);
++	atomic64_set(&local->video_last_frame_guard_bytes, 0);
++	atomic64_set(&local->video_last_est_frame_interval_ns, 0);
++	atomic64_set(&local->video_last_pre_ap_latency_ns, 0);
++	atomic64_set(&local->video_last_fq_backlog_delay_ns, 0);
++	atomic64_set(&local->video_last_low_layer_latency_ns, 0);
++	atomic64_set(&local->video_last_post_ap_proxy_ns, 0);
++	atomic64_set(&local->video_last_experiment_latency_ns, 0);
++	atomic64_set(&local->video_last_dequeue_fq_wait_ns, 0);
++	atomic64_set(&local->video_last_dequeue_low_layer_latency_ns, 0);
++	atomic64_set(&local->video_last_dequeue_post_ap_proxy_ns, 0);
++	atomic64_set(&local->video_last_dequeue_experiment_latency_ns, 0);
++	atomic64_set(&local->video_last_flow_idx, -1);
++	atomic64_set(&local->video_last_tid, -1);
++	atomic64_set(&local->video_low_layer_latency_ns, 0);
++	atomic64_set(&local->video_low_layer_latency_samples, 0);
++	atomic64_set(&local->video_last_low_layer_latency_sample_ns, 0);
+ 
+ 	spin_lock_init(&local->handle_wake_tx_queue_lock);
+ 
+--- a/net/mac80211/tx.c	2026-05-14 21:11:33.252654461 +0800
++++ b/net/mac80211/tx.c	2026-05-14 21:06:31.833482193 +0800
+@@ -1369,6 +1369,38 @@
+ 	return info->control.enqueue_time;
+ }
+ 
++static u64 ieee80211_video_low_layer_latency_ns(struct ieee80211_local *local)
++{
++	return min_t(u64, atomic64_read(&local->video_low_layer_latency_ns),
++		     FQ_VIDEO_LOW_LAYER_LATENCY_MAX_NS);
++}
++
++void ieee80211_video_low_layer_latency_report(struct ieee80211_hw *hw,
++					      u64 latency_ns)
++{
++	struct ieee80211_local *local = hw_to_local(hw);
++	u64 samples;
++	u64 old;
++	u64 sample;
++
++	if (!latency_ns)
++		return;
++
++	sample = min_t(u64, latency_ns, FQ_VIDEO_LOW_LAYER_LATENCY_MAX_NS);
++	samples = atomic64_read(&local->video_low_layer_latency_samples);
++	old = atomic64_read(&local->video_low_layer_latency_ns);
++
++	if (!samples)
++		atomic64_set(&local->video_low_layer_latency_ns, sample);
++	else
++		atomic64_set(&local->video_low_layer_latency_ns,
++			     (old * 7 + sample) >> 3);
++
++	atomic64_set(&local->video_last_low_layer_latency_sample_ns, sample);
++	atomic64_inc(&local->video_low_layer_latency_samples);
++}
++EXPORT_SYMBOL_GPL(ieee80211_video_low_layer_latency_report);
++
+ static struct sk_buff *codel_dequeue_func(struct codel_vars *cvars,
+ 					  void *ctx)
+ {
+@@ -1386,6 +1426,24 @@
+ 	else
+ 		flow = &fq->flows[cvars - local->cvars];
+ 
+-	return fq_flow_dequeue(fq, flow);
++	return fq_flow_dequeue(fq, flow, txqi->video_dequeue_info);
++}
++
++static void ieee80211_video_dequeue_info(struct ieee80211_local *local,
++					 struct txq_info *txqi,
++					 struct fq_video_dequeue_info *info)
++{
++	memset(info, 0, sizeof(*info));
++	info->now_ns = ktime_get_ns();
++	info->latency_high_ns = READ_ONCE(local->video_latency_high_ns);
++	info->low_layer_latency_ns = ieee80211_video_low_layer_latency_ns(local);
++}
++
++static bool ieee80211_video_guard_func(struct fq *fq, struct fq_tin *tin,
++				       struct fq_flow *flow, void *data)
++{
++	struct fq_video_dequeue_info *info = data;
++
++	return fq_flow_video_guard_active_at(flow, info);
+ }
+ 
+@@ -1400,6 +1477,9 @@
+ 	local = vif_to_sdata(txqi->txq.vif)->local;
+ 	hw = &local->hw;
+ 
++	if (txqi->video_dequeue_info && txqi->video_dequeue_info->flow)
++		fq_flow_video_mark_degraded(txqi->video_dequeue_info->flow);
++
+ 	ieee80211_free_txskb(hw, skb);
+ }
+ 
+@@ -1412,6 +1489,8 @@
+ 	struct codel_vars *cvars;
+ 	struct codel_params *cparams;
+ 	struct codel_stats *cstats;
++	struct fq_video_dequeue_info video_info;
++	struct sk_buff *skb;
+ 
+ 	local = container_of(fq, struct ieee80211_local, fq);
+ 	txqi = container_of(tin, struct txq_info, tin);
+@@ -1423,15 +1502,44 @@
+ 	else
+ 		cvars = &local->cvars[flow - fq->flows];
+ 
+-	return codel_dequeue(txqi,
+-			     &flow->backlog,
+-			     cparams,
+-			     cvars,
+-			     cstats,
+-			     codel_skb_len_func,
+-			     codel_skb_time_func,
+-			     codel_drop_func,
+-			     codel_dequeue_func);
++	ieee80211_video_dequeue_info(local, txqi, &video_info);
++	txqi->video_dequeue_info = &video_info;
++	if (fq_flow_video_guard_active_at(flow, &video_info))
++		skb = fq_flow_dequeue(fq, flow, &video_info);
++	else
++		skb = codel_dequeue(txqi,
++				    &flow->backlog,
++				    cparams,
++				    cvars,
++				    cstats,
++				    codel_skb_len_func,
++				    codel_skb_time_func,
++				    codel_drop_func,
++				    codel_dequeue_func);
++
++	if (skb && fq_flow_is_video(flow)) {
++		IEEE80211_SKB_CB(skb)->control.flags |=
++			IEEE80211_TX_CTRL_VIDEO_FLOW;
++		atomic64_set(&local->video_last_dequeue_fq_wait_ns,
++			     flow->video_last_dequeue_fq_wait_ns);
++		atomic64_set(&local->video_last_dequeue_low_layer_latency_ns,
++			     flow->video_last_dequeue_low_layer_latency_ns);
++		atomic64_set(&local->video_last_dequeue_post_ap_proxy_ns,
++			     flow->video_last_dequeue_post_ap_proxy_ns);
++		atomic64_set(&local->video_last_dequeue_experiment_latency_ns,
++			     flow->video_last_dequeue_experiment_latency_ns);
++		if (flow->video_frame_guard_last_dequeue) {
++			atomic64_inc(&local->video_frame_guard_dequeue_packets);
++			if (flow->video_frame_guard_last_dequeue == 2) {
++				atomic64_inc(&local->video_frame_guard_started);
++				atomic64_set(&local->video_last_frame_guard_bytes,
++					     flow->video_last_frame_guard_bytes);
++			}
++		}
++	}
++	txqi->video_dequeue_info = NULL;
++
++	return skb;
+ }
+ 
+ static void fq_skb_free_func(struct fq *fq,
+@@ -1566,12 +1678,18 @@
+ 	memset(info, 0, sizeof(*info));
+ 	info->is_video = true;
+ 	info->enqueue_time_ns = ktime_get_mono_fast_ns();
++	info->configured_frame_interval_ns =
++		READ_ONCE(local->video_frame_interval_ns);
++	info->fixed_frame_interval =
++		READ_ONCE(local->video_frame_interval_fixed);
++	info->latency_high_ns = READ_ONCE(local->video_latency_high_ns);
++	info->low_layer_latency_ns = ieee80211_video_low_layer_latency_ns(local);
+ 	ieee80211_video_fill_size_info(skb, info, pkt_len);
+ 	atomic64_inc(&local->video_size_packets);
+ 
+ 	return true;
+ }
+ 
+ static void ieee80211_txq_enqueue(struct ieee80211_local *local,
+ 				  struct txq_info *txqi,
+ 				  struct sk_buff *skb)
+@@ -1615,6 +1769,29 @@
+ 		atomic64_inc(&local->video_frame_fallback_packets);
+ 	if (video_event & FQ_VIDEO_FRAME_EVENT_FALLBACK_TIMEOUT)
+ 		atomic64_inc(&local->video_frame_fallback_timeout);
++	if (video_event & FQ_VIDEO_FRAME_EVENT_LATENCY_ESTIMATED) {
++		atomic64_inc(&local->video_frame_latency_estimated);
++		atomic64_set(&local->video_last_est_frame_interval_ns,
++			     video_info.estimated_frame_interval_ns);
++		atomic64_set(&local->video_last_pre_ap_latency_ns,
++			     video_info.pre_ap_latency_ns);
++		atomic64_set(&local->video_last_fq_backlog_delay_ns,
++			     video_info.fq_backlog_delay_ns);
++		atomic64_set(&local->video_last_low_layer_latency_ns,
++			     video_info.low_layer_latency_ns);
++		atomic64_set(&local->video_last_post_ap_proxy_ns,
++			     video_info.post_ap_proxy_ns);
++		atomic64_set(&local->video_last_experiment_latency_ns,
++			     video_info.experiment_latency_ns);
++		atomic64_set(&local->video_last_flow_idx, flow_idx);
++		atomic64_set(&local->video_last_tid, txqi->txq.tid);
++	}
++	if (video_event & FQ_VIDEO_FRAME_EVENT_HIGH_LATENCY)
++		atomic64_inc(&local->video_frame_latency_high);
++	if (video_event & FQ_VIDEO_FRAME_EVENT_FQ_BACKLOG_CLAMPED)
++		atomic64_inc(&local->video_fq_backlog_delay_clamped);
++	if (video_event & FQ_VIDEO_FRAME_EVENT_POST_AP_CLAMPED)
++		atomic64_inc(&local->video_post_ap_proxy_clamped);
+ }
+ 
+ static bool fq_vlan_filter_func(struct fq *fq, struct fq_tin *tin,
+@@ -3970,6 +4151,7 @@
+ 	int q = vif->hw_queue[txq->ac];
+ 	unsigned long flags;
+ 	bool q_stopped;
++	struct fq_video_dequeue_info video_info;
+ 
+ 	WARN_ON_ONCE(softirq_count() == 0);
+ 
+@@ -3986,6 +4168,7 @@
+ 		set_bit(IEEE80211_TXQ_DIRTY, &txqi->flags);
+ 		return NULL;
+ 	}
++	ieee80211_video_dequeue_info(local, txqi, &video_info);
+ 
+ 	spin_lock_bh(&fq->lock);
+ 
+@@ -4001,7 +4184,8 @@
+ 		if (unlikely(test_bit(IEEE80211_TXQ_STOP, &txqi->flags)))
+ 			goto out;
+ 
+-		skb = fq_tin_dequeue(fq, tin, fq_tin_dequeue_func);
++		skb = fq_tin_dequeue(fq, tin, fq_tin_dequeue_func,
++				     ieee80211_video_guard_func, &video_info);
+ 	}
+ 
+ 	if (!skb)

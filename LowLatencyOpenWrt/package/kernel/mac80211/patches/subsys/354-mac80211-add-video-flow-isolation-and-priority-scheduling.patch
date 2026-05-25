@@ -1,0 +1,452 @@
+mac80211：增加视频流隔离与优先调度机制
+
+保留 FQ 原有 new_flows 行为，在 BE 队列的旧流阶段增加
+video_flows 链表，将配置端口对应的视频流与普通 old_flows 分离。
+
+当 new_flows 为空时，调度器在 video_flows 和 old_flows 之间进行
+加权选择，使视频旧流获得更高服务机会，同时避免普通背景旧流长期
+饥饿。视频流从 new_flows 进入旧流阶段后使用更大的 DRR 赤字配额。
+
+同时增加 debugfs 配置项，用于在实验中设置需要识别的视频传输端口。
+
+---
+diff --git a/include/net/fq.h b/include/net/fq.h
+index 99fbe41..88d6c27 100644
+--- a/include/net/fq.h
++++ b/include/net/fq.h
+@@ -13,6 +13,11 @@
+ 
+ struct fq_tin;
+ 
++enum fq_flow_class {
++	FQ_FLOW_CLASS_BEST_EFFORT,
++	FQ_FLOW_CLASS_VIDEO,
++};
++
+ /**
+  * struct fq_flow - per traffic flow queue
+  *
+@@ -20,13 +25,15 @@ struct fq_tin;
+  *	hashes to an index which points to a flow that is already owned by a
+  *	different tin the packet is destined to. In such case the implementer
+  *	must provide a fallback flow
+- * @flowchain: can be linked to fq_tin's new_flows or old_flows. Used for DRR++
++ * @flowchain: can be linked to fq_tin's new_flows, video_flows or old_flows.
++ *	Used for DRR++
+  *	(deficit round robin) based round robin queuing similar to the one
+  *	found in net/sched/sch_fq_codel.c
+  * @queue: sk_buff queue to hold packets
+  * @backlog: number of bytes pending in the queue. The number of packets can be
+  *	found in @queue.qlen
+  * @deficit: used for DRR++
++ * @flow_class: implementation-defined flow priority class
+  */
+ struct fq_flow {
+ 	struct fq_tin *tin;
+@@ -34,6 +41,7 @@ struct fq_flow {
+ 	struct sk_buff_head queue;
+ 	u32 backlog;
+ 	int deficit;
++	u8 flow_class;
+ };
+ 
+ /**
+@@ -43,13 +51,17 @@ struct fq_flow {
+  * pull interleaved packets out of the associated flows.
+  *
+  * @new_flows: linked list of fq_flow
++ * @video_flows: linked list of fq_flow
+  * @old_flows: linked list of fq_flow
++ * @old_flows_round: weighted round-robin state for old-flow classes
+  */
+ struct fq_tin {
+ 	struct list_head new_flows;
++	struct list_head video_flows;
+ 	struct list_head old_flows;
+ 	struct list_head tin_list;
+ 	struct fq_flow default_flow;
++	u8 old_flows_round;
+ 	u32 backlog_bytes;
+ 	u32 backlog_packets;
+ 	u32 overlimit;
+diff --git a/include/net/fq_impl.h b/include/net/fq_impl.h
+index 9467e33..c7c381c 100644
+--- a/include/net/fq_impl.h
++++ b/include/net/fq_impl.h
+@@ -11,6 +11,52 @@
+ 
+ /* functions that are embedded into includer */
+ 
++static inline bool fq_flow_is_video(const struct fq_flow *flow)
++{
++	return flow->flow_class == FQ_FLOW_CLASS_VIDEO;
++}
++
++static inline u32 fq_flow_quantum(const struct fq *fq,
++				  const struct fq_flow *flow)
++{
++	return fq_flow_is_video(flow) ? fq->quantum << 1 : fq->quantum;
++}
++
++static inline struct list_head *fq_flow_old_list(struct fq_tin *tin,
++					 struct fq_flow *flow)
++{
++	return fq_flow_is_video(flow) ? &tin->video_flows : &tin->old_flows;
++}
++
++static inline struct list_head *fq_tin_old_head(struct fq_tin *tin)
++{
++	if (list_empty(&tin->video_flows)) {
++		tin->old_flows_round = 0;
++		return &tin->old_flows;
++	}
++
++	if (list_empty(&tin->old_flows)) {
++		tin->old_flows_round = 0;
++		return &tin->video_flows;
++	}
++
++	return tin->old_flows_round < 2 ? &tin->video_flows : &tin->old_flows;
++}
++
++static inline void fq_tin_next_old_head(struct fq_tin *tin,
++					struct list_head *head)
++{
++	if (list_empty(&tin->video_flows) || list_empty(&tin->old_flows)) {
++		tin->old_flows_round = 0;
++		return;
++	}
++
++	if (head == &tin->video_flows)
++		tin->old_flows_round++;
++	else
++		tin->old_flows_round = 0;
++}
++
+ 
+ static void
+ __fq_adjust_removal(struct fq *fq, struct fq_flow *flow, unsigned int packets,
+@@ -100,7 +146,7 @@ static struct sk_buff *fq_tin_dequeue(struct fq *fq,
+ begin:
+ 	head = &tin->new_flows;
+ 	if (list_empty(head)) {
+-		head = &tin->old_flows;
++		head = fq_tin_old_head(tin);
+ 		if (list_empty(head))
+ 			return NULL;
+ 	}
+@@ -108,9 +154,9 @@ begin:
+ 	flow = list_first_entry(head, struct fq_flow, flowchain);
+ 
+ 	if (flow->deficit <= 0) {
+-		flow->deficit += fq->quantum;
+-		list_move_tail(&flow->flowchain,
+-			       &tin->old_flows);
++		flow->deficit += fq_flow_quantum(fq, flow);
++		list_move_tail(&flow->flowchain, head == &tin->new_flows ?
++			       fq_flow_old_list(tin, flow) : head);
+ 		goto begin;
+ 	}
+ 
+@@ -118,8 +164,10 @@ begin:
+ 	if (!skb) {
+ 		/* force a pass through old_flows to prevent starvation */
+ 		if ((head == &tin->new_flows) &&
+-		    !list_empty(&tin->old_flows)) {
+-			list_move_tail(&flow->flowchain, &tin->old_flows);
++		    (!list_empty(&tin->video_flows) ||
++		     !list_empty(&tin->old_flows))) {
++			list_move_tail(&flow->flowchain,
++				       fq_flow_old_list(tin, flow));
+ 		} else {
+ 			list_del_init(&flow->flowchain);
+ 			flow->tin = NULL;
+@@ -127,6 +175,9 @@ begin:
+ 		goto begin;
+ 	}
+ 
++	if (head != &tin->new_flows)
++		fq_tin_next_old_head(tin, head);
++
+ 	flow->deficit -= skb->len;
+ 	tin->tx_bytes += skb->len;
+ 	tin->tx_packets++;
+@@ -197,6 +248,7 @@ static struct fq_flow *fq_find_fattest_flow(struct fq *fq)
+ static void fq_tin_enqueue(struct fq *fq,
+ 			   struct fq_tin *tin, u32 idx,
+ 			   struct sk_buff *skb,
++			   bool is_video,
+ 			   fq_skb_free_t free_func)
+ {
+ 	struct fq_flow *flow;
+@@ -206,6 +258,9 @@ static void fq_tin_enqueue(struct fq *fq,
+ 	lockdep_assert_held(&fq->lock);
+ 
+ 	flow = fq_flow_classify(fq, tin, idx, skb);
++	if (!flow->backlog)
++		flow->flow_class = is_video ? FQ_FLOW_CLASS_VIDEO :
++			FQ_FLOW_CLASS_BEST_EFFORT;
+ 
+ 	if (!flow->backlog) {
+ 		if (flow != &tin->default_flow)
+@@ -282,6 +337,8 @@ static void fq_tin_filter(struct fq *fq,
+ 
+ 	list_for_each_entry(flow, &tin->new_flows, flowchain)
+ 		fq_flow_filter(fq, flow, filter_func, filter_data, free_func);
++	list_for_each_entry(flow, &tin->video_flows, flowchain)
++		fq_flow_filter(fq, flow, filter_func, filter_data, free_func);
+ 	list_for_each_entry(flow, &tin->old_flows, flowchain)
+ 		fq_flow_filter(fq, flow, filter_func, filter_data, free_func);
+ }
+@@ -299,11 +356,13 @@ static void fq_flow_reset(struct fq *fq,
+ 	if (!list_empty(&flow->flowchain)) {
+ 		list_del_init(&flow->flowchain);
+ 		if (list_empty(&tin->new_flows) &&
++		    list_empty(&tin->video_flows) &&
+ 		    list_empty(&tin->old_flows))
+ 			list_del_init(&tin->tin_list);
+ 	}
+ 
+ 	flow->tin = NULL;
++	flow->flow_class = FQ_FLOW_CLASS_BEST_EFFORT;
+ 
+ 	WARN_ON_ONCE(flow->backlog);
+ }
+@@ -318,7 +377,7 @@ static void fq_tin_reset(struct fq *fq,
+ 	for (;;) {
+ 		head = &tin->new_flows;
+ 		if (list_empty(head)) {
+-			head = &tin->old_flows;
++			head = fq_tin_old_head(tin);
+ 			if (list_empty(head))
+ 				break;
+ 		}
+@@ -336,13 +395,16 @@ static void fq_flow_init(struct fq_flow *flow)
+ {
+ 	INIT_LIST_HEAD(&flow->flowchain);
+ 	__skb_queue_head_init(&flow->queue);
++	flow->flow_class = FQ_FLOW_CLASS_BEST_EFFORT;
+ }
+ 
+ static void fq_tin_init(struct fq_tin *tin)
+ {
+ 	INIT_LIST_HEAD(&tin->new_flows);
++	INIT_LIST_HEAD(&tin->video_flows);
+ 	INIT_LIST_HEAD(&tin->old_flows);
+ 	INIT_LIST_HEAD(&tin->tin_list);
++	tin->old_flows_round = 0;
+ 	fq_flow_init(&tin->default_flow);
+ }
+ 
+diff --git a/net/mac80211/main.c b/net/mac80211/main.c
+index e69de29..31a9da1 100644
+--- a/net/mac80211/main.c
++++ b/net/mac80211/main.c
+@@ -966,6 +966,8 @@ struct ieee80211_local *ieee80211_alloc_hw_nm(size_t priv_data_len,
+ 	local->airtime_flags = AIRTIME_USE_TX | AIRTIME_USE_RX;
+ 	local->aql_threshold = IEEE80211_AQL_THRESHOLD;
+ 	atomic_set(&local->aql_total_pending_airtime, 0);
++	local->video_flow_port = 12344;
++
+ 
+ 	spin_lock_init(&local->handle_wake_tx_queue_lock);
+ 
+ 	INIT_LIST_HEAD(&local->chanctx_list);
+
+diff --git a/net/mac80211/debugfs.c b/net/mac80211/debugfs.c
+index 1374ff8..ad65666 100644
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@ -149,6 +149,58 @@ static const struct file_operations aqm_ops = {
+ 	.llseek = default_llseek,
+ };
+ 
++static ssize_t video_flow_port_read(struct file *file,
++				    char __user *user_buf,
++				    size_t count,
++				    loff_t *ppos)
++{
++	struct ieee80211_local *local = file->private_data;
++	char buf[16];
++	int len;
++
++	len = scnprintf(buf, sizeof(buf), "%u\n", local->video_flow_port);
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t video_flow_port_write(struct file *file,
++				     const char __user *user_buf,
++				     size_t count,
++				     loff_t *ppos)
++{
++	struct ieee80211_local *local = file->private_data;
++	char buf[16];
++	unsigned int port;
++
++	if (count >= sizeof(buf))
++		return -EINVAL;
++
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++
++	if (count && buf[count - 1] == '\n')
++		buf[count - 1] = '\0';
++	else
++		buf[count] = '\0';
++
++	if (kstrtouint(buf, 0, &port))
++		return -EINVAL;
++
++	if (port > U16_MAX)
++		return -EINVAL;
++
++	local->video_flow_port = port;
++
++	return count;
++}
++
++static const struct file_operations video_flow_port_ops = {
++	.write = video_flow_port_write,
++	.read = video_flow_port_read,
++	.open = simple_open,
++	.llseek = default_llseek,
++};
++
+ static ssize_t airtime_flags_read(struct file *file,
+ 				  char __user *user_buf,
+ 				  size_t count, loff_t *ppos)
+@@ -717,6 +769,7 @@ void debugfs_hw_add(struct ieee80211_local *local)
+ 	DEBUGFS_ADD_MODE(aql_enable, 0600);
+ 	DEBUGFS_ADD(aql_pending);
+ 	DEBUGFS_ADD_MODE(aqm, 0600);
++	DEBUGFS_ADD_MODE(video_flow_port, 0600);
+ 
+ 	DEBUGFS_ADD_MODE(airtime_flags, 0600);
+ 
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 813eee5..26d770f 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1382,6 +1382,7 @@ struct ieee80211_local {
+ 	atomic_t aql_total_pending_airtime;
+ 	atomic_t aql_bc_pending_airtime;
+ 	atomic_t aql_ac_pending_airtime[IEEE80211_NUM_ACS];
++	u16 video_flow_port;
+ 
+ 	const struct ieee80211_ops *ops;
+ 
+diff --git a/net/mac80211/tx.c b/net/mac80211/tx.c
+index 38b5a64..bea7af0 100644
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -14,10 +14,15 @@
+ #include <linux/slab.h>
+ #include <linux/skbuff.h>
+ #include <linux/if_vlan.h>
++#include <linux/ip.h>
++#include <linux/ipv6.h>
+ #include <linux/etherdevice.h>
+ #include <linux/bitmap.h>
+ #include <linux/rcupdate.h>
+ #include <linux/export.h>
++#include <net/ipv6.h>
++#include <linux/tcp.h>
++#include <linux/udp.h>
+ #include <net/net_namespace.h>
+ #include <net/ieee80211_radiotap.h>
+ #include <net/cfg80211.h>
+@@ -1437,6 +1442,72 @@ static void fq_skb_free_func(struct fq *fq,
+ 	ieee80211_free_txskb(&local->hw, skb);
+ }
+ 
++static bool ieee80211_ports_match(const struct tcphdr *th,
++				 const struct udphdr *uh,
++				 u16 port,
++				 u8 protocol)
++{
++	if (protocol == IPPROTO_TCP)
++		return ntohs(th->source) == port || ntohs(th->dest) == port;
++
++	if (protocol == IPPROTO_UDP)
++		return ntohs(uh->source) == port || ntohs(uh->dest) == port;
++
++	return false;
++}
++
++static bool ieee80211_is_video_skb(struct ieee80211_local *local,
++				      struct sk_buff *skb)
++{
++	struct tcphdr _tcph, *th = NULL;
++	struct udphdr _udph, *uh = NULL;
++	struct ipv6hdr _ip6h, *ip6h;
++	struct iphdr _iph, *iph;
++	unsigned int offset;
++	int nexthdr;
++	u16 video_port;
++
++	video_port = READ_ONCE(local->video_flow_port);
++	if (!video_port)
++		return false;
++
++	switch (skb->protocol) {
++	case htons(ETH_P_IP):
++		offset = skb_network_offset(skb);
++		iph = skb_header_pointer(skb, offset, sizeof(_iph), &_iph);
++		if (!iph || iph->ihl < 5)
++			return false;
++
++		offset += iph->ihl * 4;
++		if (iph->protocol == IPPROTO_UDP)
++			uh = skb_header_pointer(skb, offset, sizeof(_udph), &_udph);
++		else if (iph->protocol == IPPROTO_TCP)
++			th = skb_header_pointer(skb, offset, sizeof(_tcph), &_tcph);
++		else
++			return false;
++
++		return ieee80211_ports_match(th, uh, video_port, iph->protocol);
++	case htons(ETH_P_IPV6):
++		offset = skb_network_offset(skb);
++		ip6h = skb_header_pointer(skb, offset, sizeof(_ip6h), &_ip6h);
++		if (!ip6h)
++			return false;
++
++		offset += sizeof(*ip6h);
++		nexthdr = ipv6_find_hdr(skb, &offset, -1, NULL, NULL);
++		if (nexthdr == IPPROTO_UDP)
++			uh = skb_header_pointer(skb, offset, sizeof(_udph), &_udph);
++		else if (nexthdr == IPPROTO_TCP)
++			th = skb_header_pointer(skb, offset, sizeof(_tcph), &_tcph);
++		else
++			return false;
++
++		return ieee80211_ports_match(th, uh, video_port, nexthdr);
++	default:
++		return false;
++	}
++}
++
+ static void ieee80211_txq_enqueue(struct ieee80211_local *local,
+ 				  struct txq_info *txqi,
+ 				  struct sk_buff *skb)
+@@ -1444,8 +1515,11 @@ static void ieee80211_txq_enqueue(struct ieee80211_local *local,
+ 	struct fq *fq = &local->fq;
+ 	struct fq_tin *tin = &txqi->tin;
+ 	u32 flow_idx;
++	bool is_video;
+ 
+ 	ieee80211_set_skb_enqueue_time(skb);
++	is_video = txqi->txq.ac == IEEE80211_AC_BE &&
++		ieee80211_is_video_skb(local, skb);
+ 
+ 	spin_lock_bh(&fq->lock);
+ 	/*
+@@ -1460,7 +1534,7 @@ static void ieee80211_txq_enqueue(struct ieee80211_local *local,
+ 		__skb_queue_tail(&txqi->frags, skb);
+ 	} else {
+ 		flow_idx = fq_flow_idx(fq, skb);
+-		fq_tin_enqueue(fq, tin, flow_idx, skb,
++		fq_tin_enqueue(fq, tin, flow_idx, skb, is_video,
+ 			       fq_skb_free_func);
+ 	}
+ 	spin_unlock_bh(&fq->lock);

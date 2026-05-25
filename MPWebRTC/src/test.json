@@ -1,0 +1,26 @@
+{
+    "if_num": 2,
+    "log_file": "mpshell.log",
+    "if_configs": [
+        {
+            "delay": 20,
+            "uplink": "/home/chenyan/mahimahi/traces/TMobile-LTE-driving.up",
+            "downlink": "/home/chenyan/mahimahi/traces/TMobile-LTE-driving.down",
+            "queue_params": {
+                "type": "codel",
+                "packets": 500,
+                "target": 5,
+                "interval": 100
+            }
+        },
+        {
+            "delay": 20,
+            "uplink": "/home/chenyan/mahimahi/traces/ATT-LTE-driving-2016.up",
+            "downlink": "/home/chenyan/mahimahi/traces/ATT-LTE-driving-2016.down",
+            "queue_params": {
+                "type": "droptail",
+                "packets": 500
+            }
+        }
+    ]
+}

@@ -1,0 +1,22 @@
+{
+    "if_num": 2,
+    "log_file": "mpshell.log",
+    "if_configs": [
+        {
+            "delay": 20,
+            "uplink": "/home/chenyan/WebRTC/webrtc-checkout/src/traces/Verizon-LTE-short.up",
+            "downlink": "/home/chenyan/WebRTC/webrtc-checkout/src/traces/Verizon-LTE-short.down",
+            "queue_params": {
+                "type": "infinite"
+            }
+        },
+        {
+            "delay": 20,
+            "uplink": "/home/chenyan/WebRTC/webrtc-checkout/src/traces/TMobile-LTE-short.up",
+            "downlink": "/home/chenyan/WebRTC/webrtc-checkout/src/traces/TMobile-LTE-short.down",
+            "queue_params": {
+                "type": "infinite"
+            }
+        }
+    ]
+}
